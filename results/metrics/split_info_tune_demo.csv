@@ -1,0 +1,2 @@
+n_total,n_train,n_test,split_strategy,split_point,n_cells_total,n_cells_train,n_cells_test
+159324,111527,47797,random,,875,875,872

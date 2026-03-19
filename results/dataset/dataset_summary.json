@@ -1,0 +1,66 @@
+{
+  "config_used": "configs/tune_demo.yaml",
+  "dataset_root": "data/connectivity",
+  "file_inventory": {
+    "dataset_csv": 32,
+    "dataset_old_csv": 128,
+    "dataset_total_csv": 160,
+    "by_year_month": {
+      "dataset": {
+        "2025-03": 14,
+        "2025-04": 18
+      },
+      "dataset_old": {
+        "2023-07": 28,
+        "2023-08": 31,
+        "2023-09": 35,
+        "2023-10": 24,
+        "2023-11": 10
+      },
+      "dataset_total": {
+        "2023-07": 28,
+        "2023-08": 31,
+        "2023-09": 35,
+        "2023-10": 24,
+        "2023-11": 10,
+        "2025-03": 14,
+        "2025-04": 18
+      }
+    }
+  },
+  "loaded_data_after_current_pipeline": {
+    "total_entries": 161734,
+    "total_traces": 160,
+    "total_unique_cells": 1446,
+    "modes_loaded": {
+      "bike": 75076,
+      "new": 43076,
+      "car": 42464,
+      "walk": 651,
+      "train": 467
+    }
+  },
+  "trace_statistics": {
+    "entries_per_trace": {
+      "mean": 1010.8375,
+      "std": 566.9788343437081,
+      "min": 58.0,
+      "max": 3375.0,
+      "median": 907.5
+    },
+    "unique_cells_per_trace": {
+      "mean": 66.30625,
+      "std": 35.82928217167488,
+      "min": 1.0,
+      "max": 277.0,
+      "median": 61.0
+    },
+    "path_length_m_per_trace": {
+      "mean": 55497.05028528586,
+      "std": 30189.752432577792,
+      "min": 1167.251100397044,
+      "max": 246372.5090351875,
+      "median": 50911.11826069731
+    }
+  }
+}

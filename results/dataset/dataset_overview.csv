@@ -1,0 +1,2 @@
+total_entries,total_traces,total_unique_cells,entries_per_trace_mean,entries_per_trace_std,path_length_m_per_trace_mean,path_length_m_per_trace_std,signal_mean_dbm,signal_std_dbm
+161734,160,1446,1010.8375,566.9788343437081,55497.05028528586,30189.752432577792,-101.0470525677965,10.640084400858816
