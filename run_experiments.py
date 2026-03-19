@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import itertools
 import os
@@ -357,6 +358,64 @@ def _order_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _format_summary_for_output(df: pd.DataFrame) -> pd.DataFrame:
     return _order_summary_columns(df.copy())
+
+
+def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
+    if summary_raw.empty:
+        return summary_raw
+    if "repeat_id" not in summary_raw.columns:
+        return summary_raw
+
+    # Aggregate per method/variant/threshold/params and report mean+std across repeats.
+    group_cols = [
+        c
+        for c in summary_raw.columns
+        if c
+        in {
+            "method",
+            "method_group",
+            "variant",
+            "threshold_dbm",
+            "n_train_global",
+            "n_train_used",
+            "n_test",
+        }
+        or c.startswith("param_")
+    ]
+    group_cols = [c for c in group_cols if c in summary_raw.columns]
+
+    metric_cols = [
+        c
+        for c in [
+            "tp",
+            "fp",
+            "tn",
+            "fn",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "fit_seconds",
+            "predict_seconds",
+            "total_seconds",
+        ]
+        if c in summary_raw.columns
+    ]
+
+    grouped = summary_raw.groupby(group_cols, dropna=False, as_index=False)
+    mean_df = grouped[metric_cols].mean(numeric_only=True)
+    out = mean_df.copy()
+    out["n_repeats"] = grouped.size()["size"]
+
+    std_df = grouped[metric_cols].std(numeric_only=True, ddof=0).fillna(0.0)
+    for c in metric_cols:
+        out[f"{c}_std"] = std_df[c]
+
+    # Keep a stable column order.
+    out = _order_summary_columns(out)
+    std_cols = [c for c in out.columns if c.endswith("_std")]
+    base_cols = [c for c in out.columns if c not in std_cols]
+    return out[base_cols + std_cols]
 
 
 def print_compact_summary(summary: pd.DataFrame) -> None:
@@ -972,6 +1031,12 @@ def main():
         action="store_true",
         help="Include OCID files from data/connectivity/dataset (override data.skip_ocid=true).",
     )
+    parser.add_argument(
+        "--split-repeats",
+        type=int,
+        default=None,
+        help="Repeat random split this many times (random_state + repeat_id) and aggregate metrics as mean/std.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -979,6 +1044,8 @@ def main():
         cfg.setdefault("experiment", {})["max_cells"] = int(args.max_cells)
     if args.include_ocid:
         cfg.setdefault("data", {})["skip_ocid"] = False
+    if args.split_repeats is not None:
+        cfg.setdefault("split", {})["repeats"] = int(args.split_repeats)
 
     print("[INIT] Loading data...")
     df = load_all_data(cfg)
@@ -988,17 +1055,6 @@ def main():
     print("[INIT] Applying common filters...")
     df = apply_common_filters(df, cfg)
     print(f"[INIT] Rows after filters: {len(df)} | cells: {df['cell_id'].nunique() if not df.empty else 0}")
-    print("[INIT] Building shared split...")
-    train_df, test_df, split_meta = split_data(df, cfg)
-    print(
-        f"[INIT] Split ready | strategy={split_meta.get('strategy')} "
-        f"train={len(train_df)} test={len(test_df)} split_point={split_meta.get('split_point')}"
-    )
-
-    if train_df.empty or test_df.empty:
-        print("No data available after preprocessing/split.")
-        return
-
     out_summary = _append_tag_to_path(cfg["output"]["summary_csv"], args.run_tag.strip() or None)
     out_split = _append_tag_to_path(cfg["output"]["split_info_csv"], args.run_tag.strip() or None)
     for out_path in [out_summary, out_split]:
@@ -1011,20 +1067,46 @@ def main():
         methods_to_run = [m.strip() for m in args.methods.split(",") if m.strip()]
     clear_output_files(out_summary, out_split, methods_to_run)
 
-    summary = run_all_methods(
-        train_df,
-        test_df,
-        cfg,
-        methods_to_run=methods_to_run,
-        summary_path_for_checkpoints=out_summary,
-    )
-    print("[SAVE] Writing summary...")
-    summary = _format_summary_for_output(summary)
-    per_method_paths = save_per_method_csv(summary, out_summary)
+    repeats = int(cfg.get("split", {}).get("repeats", 1))
+    repeats = max(repeats, 1)
+    base_seed = int(cfg.get("split", {}).get("random_state", 42))
+    strategy = str(cfg.get("split", {}).get("strategy", "random")).lower()
+    print(f"[INIT] Split strategy={strategy} | repeats={repeats} | base_seed={base_seed}")
 
-    split_info = pd.DataFrame(
-        [
+    all_summaries = []
+    split_rows = []
+
+    for ridx in range(repeats):
+        cfg_rep = copy.deepcopy(cfg)
+        if strategy == "random":
+            cfg_rep.setdefault("split", {})["random_state"] = base_seed + ridx
+
+        print(f"[RUN] Building split repeat {ridx + 1}/{repeats}...")
+        train_df, test_df, split_meta = split_data(df, cfg_rep)
+        print(
+            f"[RUN] Split ready | repeat={ridx} strategy={split_meta.get('strategy')} "
+            f"train={len(train_df)} test={len(test_df)} split_point={split_meta.get('split_point')}"
+        )
+        if train_df.empty or test_df.empty:
+            print(f"[WARN] Empty split at repeat={ridx}; skipping.")
+            continue
+
+        summary_r = run_all_methods(
+            train_df,
+            test_df,
+            cfg_rep,
+            methods_to_run=methods_to_run,
+            # For repeated runs we aggregate at the end; avoid mixed per-row checkpoint appends.
+            summary_path_for_checkpoints=(out_summary if repeats == 1 else None),
+        )
+        if not summary_r.empty:
+            summary_r = summary_r.copy()
+            summary_r["repeat_id"] = int(ridx)
+            all_summaries.append(summary_r)
+
+        split_rows.append(
             {
+                "repeat_id": int(ridx),
                 "n_total": len(df),
                 "n_train": len(train_df),
                 "n_test": len(test_df),
@@ -1034,8 +1116,19 @@ def main():
                 "n_cells_train": train_df["cell_id"].nunique(),
                 "n_cells_test": test_df["cell_id"].nunique(),
             }
-        ]
-    )
+        )
+
+    if not all_summaries:
+        print("No data available after preprocessing/split.")
+        return
+
+    summary_raw = pd.concat(all_summaries, ignore_index=True)
+    summary = _aggregate_repeated_summaries(summary_raw) if repeats > 1 else summary_raw
+    print("[SAVE] Writing summary...")
+    summary = _format_summary_for_output(summary)
+    per_method_paths = save_per_method_csv(summary, out_summary)
+
+    split_info = pd.DataFrame(split_rows)
     print("[SAVE] Writing split info...")
     split_info.to_csv(out_split, index=False)
 
