@@ -37,8 +37,8 @@ methods:
       min_keep: 4
   kriging:
     min_samples: 6
-    variogram_model: linear
-    nlags: 6
+    variogram_model: spherical
+    nlags: 10
     jitter_epsilon: 0.01
     outlier:
       strategy: mad
@@ -70,7 +70,7 @@ methods:
       min_keep: 8
   ml:
     min_samples: 20
-    feature_set: baseline
+    feature_set: enriched
     random_state: 42
     n_estimators: 120
     max_depth: 12

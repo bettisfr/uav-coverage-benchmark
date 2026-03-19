@@ -12,13 +12,12 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from evaluation.metrics import BinaryMetrics
 from methods.alpha_shape import AlphaShapeCoverageModel
 from methods.convex_hull import ConvexHullCoverageModel
 from methods.gpr_model import GPRCoverageModel
 from methods.idw_model import IDWCoverageModel
 from methods.kriging_model import KrigingCoverageModel
-from methods.ml_classifier import MLCoverageModel
+from methods.ml_regressor import MLSignalModel
 
 try:
     from sklearn.cluster import DBSCAN
@@ -218,40 +217,151 @@ def split_data(df: pd.DataFrame, cfg: dict):
         return df, df, {"strategy": "none", "split_point": None}
 
     scfg = cfg.get("split", {})
-    strategy = str(scfg.get("strategy", "random")).lower()
-    test_fraction = float(scfg.get("test_fraction", scfg.get("temporal_test_fraction", 0.3)))
+    test_fraction = float(scfg.get("test_fraction", 0.3))
     test_fraction = min(max(test_fraction, 0.01), 0.99)
 
-    if strategy == "temporal":
-        if "measured_at" not in df.columns or df["measured_at"].notna().sum() == 0:
-            # Fallback: if no valid timestamps exist, use deterministic random split.
-            strategy = "random"
-        else:
-            split_time = df["measured_at"].quantile(1 - test_fraction)
-            train_df = df[df["measured_at"] <= split_time].copy()
-            test_df = df[df["measured_at"] > split_time].copy()
-            return train_df, test_df, {"strategy": "temporal", "split_point": split_time}
-
-    # Default split: random (time-independent), reproducible via random_state.
+    # Default split: stratified random by cell_id (time-independent),
+    # reproducible via random_state.
     random_state = int(scfg.get("random_state", 42))
     rng = np.random.default_rng(random_state)
-    n = len(df)
-    n_test = int(round(n * test_fraction))
-    n_test = min(max(n_test, 1), n - 1)
-    perm = rng.permutation(n)
-    test_idx = perm[:n_test]
-    train_idx = perm[n_test:]
-    train_df = df.iloc[train_idx].copy()
-    test_df = df.iloc[test_idx].copy()
+
+    test_idx_parts = []
+    train_idx_parts = []
+
+    # Preserve per-cell proportions to avoid cell imbalance between train/test.
+    for _, g in df.groupby("cell_id"):
+        idx = g.index.to_numpy(dtype=int)
+        n_cell = len(idx)
+        if n_cell <= 1:
+            train_idx_parts.append(idx)
+            continue
+
+        n_test_cell = int(round(n_cell * test_fraction))
+        n_test_cell = min(max(n_test_cell, 1), n_cell - 1)
+
+        perm = rng.permutation(idx)
+        test_idx_parts.append(perm[:n_test_cell])
+        train_idx_parts.append(perm[n_test_cell:])
+
+    if test_idx_parts:
+        test_idx = np.concatenate(test_idx_parts)
+    else:
+        test_idx = np.array([], dtype=int)
+
+    if train_idx_parts:
+        train_idx = np.concatenate(train_idx_parts)
+    else:
+        train_idx = np.array([], dtype=int)
+
+    train_df = df.loc[train_idx].copy()
+    test_df = df.loc[test_idx].copy()
+
+    # Safety fallback: if something degenerates, revert to global random split.
+    if train_df.empty or test_df.empty:
+        n = len(df)
+        n_test = int(round(n * test_fraction))
+        n_test = min(max(n_test, 1), n - 1)
+        perm = rng.permutation(n)
+        test_pos = perm[:n_test]
+        train_pos = perm[n_test:]
+        train_df = df.iloc[train_pos].copy()
+        test_df = df.iloc[test_pos].copy()
+
     return train_df, test_df, {"strategy": "random", "split_point": None}
 
 
-def _evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    tp = int(np.sum((y_pred == 1) & (y_true == 1)))
-    fp = int(np.sum((y_pred == 1) & (y_true == 0)))
-    tn = int(np.sum((y_pred == 0) & (y_true == 0)))
-    fn = int(np.sum((y_pred == 0) & (y_true == 1)))
-    return BinaryMetrics(tp=tp, fp=fp, tn=tn, fn=fn).to_dict()
+def build_stratified_kfold_splits(df: pd.DataFrame, n_splits: int, random_state: int) -> List[tuple[pd.DataFrame, pd.DataFrame, dict]]:
+    if df.empty:
+        return []
+    n_splits = int(max(2, n_splits))
+    rng = np.random.default_rng(int(random_state))
+
+    # For each cell_id, partition its samples into K disjoint chunks.
+    grouped_chunks: Dict[int, List[np.ndarray]] = {}
+    for cell_id, g in df.groupby("cell_id"):
+        idx = g.index.to_numpy(dtype=int)
+        perm = rng.permutation(idx)
+        grouped_chunks[int(cell_id)] = [chunk.astype(int) for chunk in np.array_split(perm, n_splits)]
+
+    splits: List[tuple[pd.DataFrame, pd.DataFrame, dict]] = []
+    for fold_id in range(n_splits):
+        test_parts = []
+        train_parts = []
+        for chunks in grouped_chunks.values():
+            test_chunk = chunks[fold_id]
+            train_chunks = [c for i, c in enumerate(chunks) if i != fold_id and len(c) > 0]
+            if len(test_chunk) > 0:
+                test_parts.append(test_chunk)
+            if train_chunks:
+                train_parts.append(np.concatenate(train_chunks))
+
+        test_idx = np.concatenate(test_parts) if test_parts else np.array([], dtype=int)
+        train_idx = np.concatenate(train_parts) if train_parts else np.array([], dtype=int)
+        train_df = df.loc[train_idx].copy()
+        test_df = df.loc[test_idx].copy()
+
+        if train_df.empty or test_df.empty:
+            continue
+
+        splits.append(
+            (
+                train_df,
+                test_df,
+                {
+                    "strategy": "stratified_kfold",
+                    "split_point": None,
+                    "fold_id": int(fold_id),
+                    "n_splits": int(n_splits),
+                },
+            )
+        )
+
+    return splits
+
+
+def _evaluate_regression(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    n_valid = int(np.sum(mask))
+    if n_valid == 0:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "pearson": float("nan"),
+            "spearman": float("nan"),
+            "n_valid": 0,
+        }
+
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    err = yp - yt
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+
+    ss_res = float(np.sum((yt - yp) ** 2))
+    yt_mean = float(np.mean(yt))
+    ss_tot = float(np.sum((yt - yt_mean) ** 2))
+    r2 = float("nan") if ss_tot <= 1e-12 else float(1.0 - (ss_res / ss_tot))
+
+    if len(yt) < 2:
+        pearson = float("nan")
+        spearman = float("nan")
+    else:
+        pearson = float(np.corrcoef(yt, yp)[0, 1])
+        yt_rank = pd.Series(yt).rank(method="average").to_numpy(dtype=float)
+        yp_rank = pd.Series(yp).rank(method="average").to_numpy(dtype=float)
+        spearman = float(np.corrcoef(yt_rank, yp_rank)[0, 1])
+
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "pearson": pearson,
+        "spearman": spearman,
+        "n_valid": n_valid,
+    }
 
 
 def _flatten_params(prefix: str, obj) -> Dict[str, object]:
@@ -298,26 +408,24 @@ def _method_summary(
     method_name: str,
     method_group: str,
     variant: int,
-    threshold_dbm: float,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
+    y_true_signal: np.ndarray,
+    y_pred_signal: np.ndarray,
     fit_s: float,
     pred_s: float,
     method_cfg: dict | None = None,
     n_train_global: int | None = None,
     n_train_used: int | None = None,
 ) -> Dict[str, float]:
-    metrics = _evaluate_predictions(y_true, y_pred)
+    metrics = _evaluate_regression(y_true_signal, y_pred_signal)
     params_flat = _flatten_params("param", method_cfg or {})
     metrics.update(
         {
             "method": method_name,
             "method_group": method_group,
             "variant": int(variant),
-            "threshold_dbm": float(threshold_dbm),
             "n_train_global": (None if n_train_global is None else int(n_train_global)),
             "n_train_used": (None if n_train_used is None else int(n_train_used)),
-            "n_test": int(len(y_true)),
+            "n_test": int(len(y_true_signal)),
             "fit_seconds": float(fit_s),
             "predict_seconds": float(pred_s),
             "total_seconds": float(fit_s + pred_s),
@@ -335,15 +443,12 @@ def _order_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
         "method",
         "method_group",
         "variant",
-        "threshold_dbm",
-        "tp",
-        "fp",
-        "tn",
-        "fn",
-        "precision",
-        "recall",
-        "f1",
-        "accuracy",
+        "mae",
+        "rmse",
+        "r2",
+        "pearson",
+        "spearman",
+        "n_valid",
         "n_train_global",
         "n_train_used",
         "n_test",
@@ -366,7 +471,7 @@ def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
     if "repeat_id" not in summary_raw.columns:
         return summary_raw
 
-    # Aggregate per method/variant/threshold/params and report mean+std across repeats.
+    # Aggregate per method/variant/params and report mean+std across repeats.
     group_cols = [
         c
         for c in summary_raw.columns
@@ -375,7 +480,6 @@ def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
             "method",
             "method_group",
             "variant",
-            "threshold_dbm",
             "n_train_global",
             "n_train_used",
             "n_test",
@@ -387,14 +491,12 @@ def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
     metric_cols = [
         c
         for c in [
-            "tp",
-            "fp",
-            "tn",
-            "fn",
-            "precision",
-            "recall",
-            "f1",
-            "accuracy",
+            "mae",
+            "rmse",
+            "r2",
+            "pearson",
+            "spearman",
+            "n_valid",
             "fit_seconds",
             "predict_seconds",
             "total_seconds",
@@ -427,11 +529,12 @@ def print_compact_summary(summary: pd.DataFrame) -> None:
         "method",
         "method_group",
         "variant",
-        "threshold_dbm",
-        "precision",
-        "recall",
-        "f1",
-        "accuracy",
+        "mae",
+        "rmse",
+        "r2",
+        "pearson",
+        "spearman",
+        "n_valid",
         "fit_seconds",
         "predict_seconds",
         "total_seconds",
@@ -450,15 +553,11 @@ def print_compact_summary(summary: pd.DataFrame) -> None:
         "param_max_depth",
     ]
     cols = [c for c in preferred_cols if c in summary.columns]
-    sort_by = ["f1", "precision"]
-    ascending = [False, False]
-    if "threshold_dbm" in cols:
-        sort_by = ["threshold_dbm"] + sort_by
-        ascending = [False] + ascending
+    sort_by = ["rmse", "mae"]
+    ascending = [True, True]
     compact = summary[cols].sort_values(by=sort_by, ascending=ascending).copy()
     compact = compact.rename(
         columns={
-            "threshold_dbm": "thr_dbm",
             "fit_seconds": "fit_sec",
             "predict_seconds": "predict_sec",
             "total_seconds": "total_sec",
@@ -553,7 +652,7 @@ def clear_output_files(summary_path: str, split_path: str, methods_to_run: List[
         "gpr": ["gpr", "gpr_missing_dep"],
         "ml": ["ml", "ml_missing_dep"],
     }
-    selected = methods_to_run or ["convex_hull", "kriging", "idw", "ml"]
+    selected = methods_to_run or ["convex_hull", "alpha_shape", "kriging", "idw", "gpr", "ml"]
 
     base, ext = os.path.splitext(summary_path)
     ext = ext or ".csv"
@@ -629,19 +728,16 @@ def run_all_methods(
     summary_path_for_checkpoints: str | None = None,
 ) -> pd.DataFrame:
     test_df = test_df.reset_index(drop=True)
-    thr_cfg = cfg["preprocess"]["signal_threshold_dbm"]
-    thresholds = [float(x) for x in thr_cfg] if isinstance(thr_cfg, list) else [float(thr_cfg)]
-
     mcfg = cfg["methods"]
-    methods_set = set(methods_to_run or ["convex_hull", "kriging", "idw", "ml"])
+    methods_set = set(methods_to_run or ["convex_hull", "alpha_shape", "kriging", "idw", "gpr", "ml"])
 
     test_cells = test_df["cell_id"].to_numpy(dtype=int)
     test_lons = test_df["lon"].to_numpy(dtype=float)
     test_lats = test_df["lat"].to_numpy(dtype=float)
+    y_true_signal = test_df["signal"].to_numpy(dtype=float)
     n_train_global = int(len(train_df))
 
     summaries = []
-    total_thr = len(thresholds)
     method_sequence = [
         ("convex_hull", "CONVEX_HULL"),
         ("alpha_shape", "ALPHA_SHAPE"),
@@ -666,35 +762,51 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
                 model = ConvexHullCoverageModel(min_samples=int(method_cfg["min_samples"]))
                 t0 = time.perf_counter()
-                model.fit(train_m, "cell_id", "lon", "lat")
+                model.fit(
+                    train_m,
+                    "cell_id",
+                    "lon",
+                    "lat",
+                    "signal",
+                    dist_col="dist_bs_m",
+                    bs_lon_col="bs_lon",
+                    bs_lat_col="bs_lat",
+                )
                 fit_s = time.perf_counter() - t0
                 print(f"[{method_label}][v{vidx}] Done Convex Hull (fit={fit_s:.3f}s)")
                 fitted.append((vidx, method_cfg, model, fit_s, int(len(train_m))))
 
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, model, fit_s, n_train_used in fitted:
-                    t0 = time.perf_counter()
-                    y_pred = np.array([int(model.predict_inside(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)], dtype=int)
-                    pred_s = time.perf_counter() - t0
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=n_train_used,
-                        )
+            cached_predictions = []
+            for vidx, method_cfg, model, fit_s, n_train_used in fitted:
+                t0 = time.perf_counter()
+                sig_pred = np.array(
+                    [float(model.predict_signal(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)],
+                    dtype=float,
+                )
+                pred_signal_s = time.perf_counter() - t0
+                cached_predictions.append((vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s))
+                print(
+                    f"[{method_label}][v{vidx}] Cached Convex Hull-LR signal prediction "
+                    f"(all test points, {pred_signal_s:.3f}s)"
+                )
+
+            for vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred,
+                        fit_s,
+                        pred_signal_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=n_train_used,
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done Convex Hull predict (thr={thr:.1f}, pred={pred_s:.3f}s)")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done Convex Hull-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "alpha_shape":
             variants = _expand_grid(mcfg["alpha_shape"])
@@ -710,35 +822,51 @@ def run_all_methods(
                     alpha=float(method_cfg["alpha"]),
                 )
                 t0 = time.perf_counter()
-                model.fit(train_m, "cell_id", "lon", "lat")
+                model.fit(
+                    train_m,
+                    "cell_id",
+                    "lon",
+                    "lat",
+                    "signal",
+                    dist_col="dist_bs_m",
+                    bs_lon_col="bs_lon",
+                    bs_lat_col="bs_lat",
+                )
                 fit_s = time.perf_counter() - t0
                 print(f"[{method_label}][v{vidx}] Done Alpha-shape (fit={fit_s:.3f}s)")
                 fitted.append((vidx, method_cfg, model, fit_s, int(len(train_m))))
 
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, model, fit_s, n_train_used in fitted:
-                    t0 = time.perf_counter()
-                    y_pred = np.array([int(model.predict_inside(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)], dtype=int)
-                    pred_s = time.perf_counter() - t0
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=n_train_used,
-                        )
+            cached_predictions = []
+            for vidx, method_cfg, model, fit_s, n_train_used in fitted:
+                t0 = time.perf_counter()
+                sig_pred = np.array(
+                    [float(model.predict_signal(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)],
+                    dtype=float,
+                )
+                pred_signal_s = time.perf_counter() - t0
+                cached_predictions.append((vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s))
+                print(
+                    f"[{method_label}][v{vidx}] Cached Alpha-Shape-LR signal prediction "
+                    f"(all test points, {pred_signal_s:.3f}s)"
+                )
+
+            for vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred,
+                        fit_s,
+                        pred_signal_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=n_train_used,
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done Alpha-shape predict (thr={thr:.1f}, pred={pred_s:.3f}s)")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done Alpha-Shape-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "kriging":
             variants = _expand_grid(mcfg["kriging"])
@@ -750,9 +878,11 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
                 model = KrigingCoverageModel(
                     min_samples=int(method_cfg["min_samples"]),
-                    variogram_model=str(method_cfg.get("variogram_model", "linear")),
-                    nlags=int(method_cfg.get("nlags", 6)),
+                    variogram_model=str(method_cfg.get("variogram_model", "spherical")),
+                    nlags=int(method_cfg.get("nlags", 10)),
                     jitter_epsilon=float(method_cfg.get("jitter_epsilon", 1e-2)),
+                    min_signal_dbm=float(cfg.get("preprocess", {}).get("min_signal_dbm", -150.0)),
+                    max_signal_dbm=float(cfg.get("preprocess", {}).get("max_signal_dbm", -30.0)),
                 )
                 t0 = time.perf_counter()
                 model.fit(train_m, "cell_id", "lon", "lat", "signal")
@@ -781,32 +911,24 @@ def run_all_methods(
                     f"(all test points, {pred_signal_s:.3f}s)"
                 )
 
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, method_group, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
-                    t0 = time.perf_counter()
-                    y_pred = np.where(np.isnan(sig_pred), 0, (sig_pred >= thr).astype(int))
-                    threshold_s = time.perf_counter() - t0
-                    # Amortize threshold-independent Kriging signal prediction across thresholds.
-                    pred_s = (pred_signal_s / float(total_thr)) + threshold_s
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=n_train_used,
-                        )
+            for vidx, method_cfg, method_group, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
+                sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred_clean,
+                        fit_s,
+                        pred_signal_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=n_train_used,
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done Kriging predict (thr={thr:.1f}, pred={pred_s:.3f}s)")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done Kriging regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "idw":
             variants = _expand_grid(mcfg["idw"])
@@ -829,34 +951,30 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Done IDW (fit={fit_s:.3f}s)")
                 fitted.append((vidx, method_cfg, method_group, model, fit_s, int(len(train_m))))
 
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
-                    t0 = time.perf_counter()
-                    y_pred = np.zeros(shape=len(test_df), dtype=int)
-                    for cell_id, idx in test_df.groupby("cell_id").groups.items():
-                        idx = np.asarray(list(idx), dtype=int)
-                        sig = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
-                        y_pred[idx] = np.where(np.isnan(sig), 0, (sig >= thr).astype(int))
-                    pred_s = time.perf_counter() - t0
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=n_train_used,
-                        )
+            for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
+                t0 = time.perf_counter()
+                sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
+                for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                    idx = np.asarray(list(idx), dtype=int)
+                    sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
+                pred_s = time.perf_counter() - t0
+                sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred_clean,
+                        fit_s,
+                        pred_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=n_train_used,
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done IDW predict (thr={thr:.1f}, pred={pred_s:.3f}s)")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done IDW regression (pred={pred_s:.3f}s)")
 
         elif method_key == "ml":
             variants = _expand_grid(mcfg["ml"])
@@ -869,88 +987,77 @@ def run_all_methods(
 
             groups = list(test_df.groupby("cell_id").groups.items())
             total_groups = len(groups)
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, base_train_m in preprocessed_train:
-                    feature_set = str(method_cfg.get("feature_set", "baseline")).lower()
-                    if feature_set == "enriched":
-                        feature_cols = [
-                            c
-                            for c in [
-                                "lon",
-                                "lat",
-                                "dist_bs_m",
-                                "delta_alt_m",
-                                "bs_dem_alt_m",
-                                "bs_is_5g",
-                                "bs_band_num",
-                            ]
-                            if c in base_train_m.columns and c in test_df.columns
+            for vidx, method_cfg, base_train_m in preprocessed_train:
+                feature_set = str(method_cfg.get("feature_set", "baseline")).lower()
+                if feature_set == "enriched":
+                    feature_cols = [
+                        c
+                        for c in [
+                            "dist_bs_m",
                         ]
-                        if len(feature_cols) < 2:
-                            feature_cols = ["lon", "lat"]
-                    else:
+                        if c in base_train_m.columns and c in test_df.columns
+                    ]
+                    if len(feature_cols) < 1:
                         feature_cols = ["lon", "lat"]
-                    predict_progress_every = int(method_cfg.get("predict_progress_every", 50))
-                    print(f"[{method_label}][v{vidx}] Fitting ML classifier... features={feature_set}:{','.join(feature_cols)}")
-                    train_m = base_train_m.copy()
-                    train_m["label"] = (train_m["signal"] >= thr).astype(int)
-                    model = MLCoverageModel(
-                        min_samples=int(method_cfg["min_samples"]),
-                        model=str(method_cfg.get("model", "rf")),
-                        random_state=int(method_cfg.get("random_state", 42)),
-                        n_estimators=int(method_cfg.get("n_estimators", 120)),
-                        max_depth=(None if method_cfg.get("max_depth") is None else int(method_cfg.get("max_depth"))),
-                        min_samples_leaf=int(method_cfg.get("min_samples_leaf", 3)),
-                        min_samples_split=int(method_cfg.get("min_samples_split", 2)),
-                        learning_rate=float(method_cfg.get("learning_rate", 0.1)),
-                        subsample=float(method_cfg.get("subsample", 1.0)),
-                        colsample_bytree=float(method_cfg.get("colsample_bytree", 1.0)),
-                        class_weight=method_cfg.get("class_weight"),
-                        use_gpu=bool(method_cfg.get("use_gpu", False)),
-                    )
-                    t0 = time.perf_counter()
-                    model.fit(
-                        train_m,
-                        "cell_id",
-                        "lon",
-                        "lat",
-                        "label",
-                        feature_cols=feature_cols,
-                        progress_every=int(method_cfg.get("fit_progress_every", 50)),
-                        log_fn=print,
-                    )
-                    fit_s = time.perf_counter() - t0
-                    suffix = "" if model.available else "_missing_dep"
-                    method_group = f"4_ml{suffix}"
+                else:
+                    feature_cols = ["lon", "lat"]
+                predict_progress_every = int(method_cfg.get("predict_progress_every", 50))
+                print(f"[{method_label}][v{vidx}] Fitting ML regressor... features={feature_set}:{','.join(feature_cols)}")
+                train_m = base_train_m.copy()
+                model = MLSignalModel(
+                    min_samples=int(method_cfg["min_samples"]),
+                    model=str(method_cfg.get("model", "rf")),
+                    random_state=int(method_cfg.get("random_state", 42)),
+                    n_estimators=int(method_cfg.get("n_estimators", 120)),
+                    max_depth=(None if method_cfg.get("max_depth") is None else int(method_cfg.get("max_depth"))),
+                    min_samples_leaf=int(method_cfg.get("min_samples_leaf", 3)),
+                    min_samples_split=int(method_cfg.get("min_samples_split", 2)),
+                    learning_rate=float(method_cfg.get("learning_rate", 0.1)),
+                    subsample=float(method_cfg.get("subsample", 1.0)),
+                    colsample_bytree=float(method_cfg.get("colsample_bytree", 1.0)),
+                    use_gpu=bool(method_cfg.get("use_gpu", False)),
+                )
+                t0 = time.perf_counter()
+                model.fit(
+                    train_m,
+                    "cell_id",
+                    "lon",
+                    "lat",
+                    "signal",
+                    feature_cols=feature_cols,
+                    progress_every=int(method_cfg.get("fit_progress_every", 50)),
+                    log_fn=print,
+                )
+                fit_s = time.perf_counter() - t0
+                suffix = "" if model.available else "_missing_dep"
+                method_group = f"4_ml{suffix}"
 
-                    t0 = time.perf_counter()
-                    y_pred = np.zeros(shape=len(test_df), dtype=int)
-                    for gidx, (cell_id, idx) in enumerate(groups, start=1):
-                        idx = np.asarray(list(idx), dtype=int)
-                        pred = model.predict_on_frame(int(cell_id), test_df.iloc[idx][feature_cols]).astype(int)
-                        y_pred[idx] = pred
-                        if gidx % predict_progress_every == 0 or gidx == total_groups:
-                            print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")
-                    pred_s = time.perf_counter() - t0
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=int(len(base_train_m)),
-                        )
+                t0 = time.perf_counter()
+                sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
+                for gidx, (cell_id, idx) in enumerate(groups, start=1):
+                    idx = np.asarray(list(idx), dtype=int)
+                    pred = model.predict_on_frame(int(cell_id), test_df.iloc[idx][feature_cols]).astype(float)
+                    sig_pred[idx] = pred
+                    if gidx % predict_progress_every == 0 or gidx == total_groups:
+                        print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")
+                pred_s = time.perf_counter() - t0
+                sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred_clean,
+                        fit_s,
+                        pred_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=int(len(base_train_m)),
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done ML{suffix} (fit={fit_s:.3f}s, thr={thr:.1f})")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done ML{suffix} regression (fit={fit_s:.3f}s, pred={pred_s:.3f}s)")
 
         elif method_key == "gpr":
             variants = _expand_grid(mcfg["gpr"])
@@ -977,36 +1084,32 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Done GPR{suffix} (fit={fit_s:.3f}s)")
                 fitted.append((vidx, method_cfg, method_group, model, fit_s, int(len(train_m))))
 
-            for tidx, thr in enumerate(thresholds, start=1):
-                print(f"[{method_label}] Threshold {tidx}/{total_thr}: {thr:.1f} dBm")
-                y_true = (test_df["signal"].to_numpy(dtype=float) >= thr).astype(int)
-                for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
-                    t0 = time.perf_counter()
-                    y_pred = np.zeros(shape=len(test_df), dtype=int)
-                    for cell_id, idx in test_df.groupby("cell_id").groups.items():
-                        idx = np.asarray(list(idx), dtype=int)
-                        sig = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
-                        y_pred[idx] = np.where(np.isnan(sig), 0, (sig >= thr).astype(int))
-                    pred_s = time.perf_counter() - t0
-                    summaries.append(
-                        _method_summary(
-                            f"{method_group}_v{vidx}",
-                            method_group,
-                            vidx,
-                            thr,
-                            y_true,
-                            y_pred,
-                            fit_s,
-                            pred_s,
-                            method_cfg=method_cfg,
-                            n_train_global=n_train_global,
-                            n_train_used=n_train_used,
-                        )
+            for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
+                t0 = time.perf_counter()
+                sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
+                for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                    idx = np.asarray(list(idx), dtype=int)
+                    sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
+                pred_s = time.perf_counter() - t0
+                sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
+                summaries.append(
+                    _method_summary(
+                        f"{method_group}_v{vidx}",
+                        method_group,
+                        vidx,
+                        y_true_signal,
+                        sig_pred_clean,
+                        fit_s,
+                        pred_s,
+                        method_cfg=method_cfg,
+                        n_train_global=n_train_global,
+                        n_train_used=n_train_used,
                     )
-                    append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
-                    print(f"[{method_label}][v{vidx}] Done GPR predict (thr={thr:.1f}, pred={pred_s:.3f}s)")
+                )
+                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                print(f"[{method_label}][v{vidx}] Done GPR regression (pred={pred_s:.3f}s)")
 
-        # Method-level checkpoint save (all thresholds done for this method)
+        # Method-level checkpoint save
         if summary_path_for_checkpoints:
             print("[CHECKPOINT] Method completed (rows already appended).")
 
@@ -1019,7 +1122,7 @@ def main():
     parser.add_argument(
         "--methods",
         default="all",
-        help="Comma-separated subset: convex_hull,alpha_shape,kriging,idw,gpr,ml (all=convex_hull,kriging,idw,ml)",
+        help="Comma-separated subset: convex_hull,alpha_shape,kriging,idw,gpr,ml (all=all six methods)",
     )
     parser.add_argument(
         "--run-tag",
@@ -1035,7 +1138,13 @@ def main():
         "--split-repeats",
         type=int,
         default=None,
-        help="Repeat random split this many times (random_state + repeat_id) and aggregate metrics as mean/std.",
+        help="Number of repeated stratified random splits by cell_id (1 = single split).",
+    )
+    parser.add_argument(
+        "--kfolds",
+        type=int,
+        default=None,
+        help="Enable stratified K-fold split by cell_id with the given number of folds.",
     )
     args = parser.parse_args()
 
@@ -1046,6 +1155,9 @@ def main():
         cfg.setdefault("data", {})["skip_ocid"] = False
     if args.split_repeats is not None:
         cfg.setdefault("split", {})["repeats"] = int(args.split_repeats)
+    if args.kfolds is not None:
+        cfg.setdefault("split", {})["strategy"] = "stratified_kfold"
+        cfg.setdefault("split", {})["n_splits"] = int(args.kfolds)
 
     print("[INIT] Loading data...")
     df = load_all_data(cfg)
@@ -1071,25 +1183,41 @@ def main():
     repeats = max(repeats, 1)
     base_seed = int(cfg.get("split", {}).get("random_state", 42))
     strategy = str(cfg.get("split", {}).get("strategy", "random")).lower()
-    print(f"[INIT] Split strategy={strategy} | repeats={repeats} | base_seed={base_seed}")
+    n_splits = int(cfg.get("split", {}).get("n_splits", 5))
+    print(f"[INIT] Split strategy={strategy} | repeats={repeats} | n_splits={n_splits} | base_seed={base_seed}")
 
     all_summaries = []
     split_rows = []
 
-    for ridx in range(repeats):
+    split_jobs: List[tuple[int, pd.DataFrame, pd.DataFrame, dict]] = []
+    if strategy == "stratified_kfold":
+        kfold_splits = build_stratified_kfold_splits(df, n_splits=n_splits, random_state=base_seed)
+        for ridx, (train_df, test_df, split_meta) in enumerate(kfold_splits):
+            split_jobs.append((ridx, train_df, test_df, split_meta))
+    else:
+        print(f"[INIT] Using stratified random split by cell_id with repeats={repeats} (repeats=1 => single split).")
+        for ridx in range(repeats):
+            cfg_rep = copy.deepcopy(cfg)
+            if strategy == "random":
+                cfg_rep.setdefault("split", {})["random_state"] = base_seed + ridx
+            train_df, test_df, split_meta = split_data(df, cfg_rep)
+            split_jobs.append((ridx, train_df, test_df, split_meta))
+
+    total_runs = len(split_jobs)
+    for run_idx, (ridx, train_df, test_df, split_meta) in enumerate(split_jobs, start=1):
+        print(f"[RUN] Split {run_idx}/{total_runs}...")
+        print(
+            f"[RUN] Split ready | run={ridx} strategy={split_meta.get('strategy')} "
+            f"train={len(train_df)} test={len(test_df)} split_point={split_meta.get('split_point')} "
+            f"fold={split_meta.get('fold_id')}"
+        )
+        if train_df.empty or test_df.empty:
+            print(f"[WARN] Empty split at run={ridx}; skipping.")
+            continue
+
         cfg_rep = copy.deepcopy(cfg)
         if strategy == "random":
             cfg_rep.setdefault("split", {})["random_state"] = base_seed + ridx
-
-        print(f"[RUN] Building split repeat {ridx + 1}/{repeats}...")
-        train_df, test_df, split_meta = split_data(df, cfg_rep)
-        print(
-            f"[RUN] Split ready | repeat={ridx} strategy={split_meta.get('strategy')} "
-            f"train={len(train_df)} test={len(test_df)} split_point={split_meta.get('split_point')}"
-        )
-        if train_df.empty or test_df.empty:
-            print(f"[WARN] Empty split at repeat={ridx}; skipping.")
-            continue
 
         summary_r = run_all_methods(
             train_df,
@@ -1097,7 +1225,7 @@ def main():
             cfg_rep,
             methods_to_run=methods_to_run,
             # For repeated runs we aggregate at the end; avoid mixed per-row checkpoint appends.
-            summary_path_for_checkpoints=(out_summary if repeats == 1 else None),
+            summary_path_for_checkpoints=(out_summary if total_runs == 1 else None),
         )
         if not summary_r.empty:
             summary_r = summary_r.copy()
@@ -1112,6 +1240,8 @@ def main():
                 "n_test": len(test_df),
                 "split_strategy": split_meta.get("strategy"),
                 "split_point": split_meta.get("split_point"),
+                "fold_id": split_meta.get("fold_id"),
+                "n_splits": split_meta.get("n_splits"),
                 "n_cells_total": df["cell_id"].nunique(),
                 "n_cells_train": train_df["cell_id"].nunique(),
                 "n_cells_test": test_df["cell_id"].nunique(),
@@ -1123,7 +1253,7 @@ def main():
         return
 
     summary_raw = pd.concat(all_summaries, ignore_index=True)
-    summary = _aggregate_repeated_summaries(summary_raw) if repeats > 1 else summary_raw
+    summary = _aggregate_repeated_summaries(summary_raw) if total_runs > 1 else summary_raw
     print("[SAVE] Writing summary...")
     summary = _format_summary_for_output(summary)
     per_method_paths = save_per_method_csv(summary, out_summary)
@@ -1137,7 +1267,7 @@ def main():
         for p in per_method_paths:
             print(f" - {p}")
     print(f"Saved split info to {out_split}")
-    print("[RESULT] Compact table (sorted by F1):")
+    print("[RESULT] Compact table (sorted by RMSE):")
     print_compact_summary(summary)
 
 
