@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 class CellModel:
     model: Optional[object]
     constant_value: Optional[float]
+    feature_medians: Dict[str, float]
 
 
 class MLSignalModel:
@@ -118,12 +119,15 @@ class MLSignalModel:
             )
         return None
 
-    def _prepare_x(self, frame, feature_cols):
+    def _prepare_x(self, frame, feature_cols, feature_medians: Optional[Dict[str, float]] = None):
         xdf = frame[feature_cols].copy()
         for c in feature_cols:
             arr = np.asarray(xdf[c], dtype=float)
-            finite = arr[np.isfinite(arr)]
-            med = float(np.median(finite)) if finite.size > 0 else 0.0
+            if feature_medians is not None and c in feature_medians:
+                med = float(feature_medians[c])
+            else:
+                finite = arr[np.isfinite(arr)]
+                med = float(np.median(finite)) if finite.size > 0 else 0.0
             xdf[c] = pd.Series(arr).fillna(med)
         return xdf.to_numpy(dtype=float)
 
@@ -148,29 +152,30 @@ class MLSignalModel:
         for idx, (cell_id, group) in enumerate(groups, start=1):
             cols = [c for c in self.feature_cols if c in group.columns]
             if len(cols) != len(self.feature_cols):
-                self.models[int(cell_id)] = CellModel(model=None, constant_value=float("-inf"))
+                self.models[int(cell_id)] = CellModel(model=None, constant_value=float("-inf"), feature_medians={})
                 continue
 
-            g = group[cols + [signal_col]].dropna(subset=[signal_col])
+            g = group[cols + [signal_col]].dropna(subset=cols + [signal_col])
             y = g[signal_col].astype(float).to_numpy()
-            x = self._prepare_x(g, self.feature_cols)
+            feature_medians = {c: float(g[c].astype(float).median()) for c in cols}
+            x = self._prepare_x(g, self.feature_cols, feature_medians=feature_medians)
 
             if len(g) < self.min_samples:
                 const = float(np.mean(y)) if len(y) > 0 else float("-inf")
-                self.models[int(cell_id)] = CellModel(model=None, constant_value=const)
+                self.models[int(cell_id)] = CellModel(model=None, constant_value=const, feature_medians=feature_medians)
                 continue
 
             try:
                 reg = self._build_model()
                 if reg is None:
                     const = float(np.mean(y)) if len(y) > 0 else float("-inf")
-                    self.models[int(cell_id)] = CellModel(model=None, constant_value=const)
+                    self.models[int(cell_id)] = CellModel(model=None, constant_value=const, feature_medians=feature_medians)
                     continue
                 reg.fit(x, y)
-                self.models[int(cell_id)] = CellModel(model=reg, constant_value=None)
+                self.models[int(cell_id)] = CellModel(model=reg, constant_value=None, feature_medians=feature_medians)
             except Exception:
                 const = float(np.mean(y)) if len(y) > 0 else float("-inf")
-                self.models[int(cell_id)] = CellModel(model=None, constant_value=const)
+                self.models[int(cell_id)] = CellModel(model=None, constant_value=const, feature_medians=feature_medians)
 
             if progress_every > 0 and log_fn is not None and (idx % progress_every == 0 or idx == total):
                 log_fn(f"[ML-REG] fit progress: {idx}/{total} cells")
@@ -185,6 +190,6 @@ class MLSignalModel:
         cols = [c for c in self.feature_cols if c in frame.columns]
         if len(cols) != len(self.feature_cols):
             return np.full(shape=len(frame), fill_value=float("-inf"), dtype=float)
-        x = self._prepare_x(frame, self.feature_cols)
+        x = self._prepare_x(frame, self.feature_cols, feature_medians=model.feature_medians)
         pred = model.model.predict(x)
         return np.asarray(pred, dtype=float)

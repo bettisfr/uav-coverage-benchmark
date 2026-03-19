@@ -760,6 +760,10 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Fitting Convex Hull...")
                 train_m = preprocess_for_method(train_df, method_cfg)
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    train_m = train_m.copy()
+                    train_m["cell_id"] = 0
                 model = ConvexHullCoverageModel(min_samples=int(method_cfg["min_samples"]))
                 t0 = time.perf_counter()
                 model.fit(
@@ -779,10 +783,17 @@ def run_all_methods(
             cached_predictions = []
             for vidx, method_cfg, model, fit_s, n_train_used in fitted:
                 t0 = time.perf_counter()
-                sig_pred = np.array(
-                    [float(model.predict_signal(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)],
-                    dtype=float,
-                )
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    sig_pred = np.array(
+                        [float(model.predict_signal(0, lo, la)) for lo, la in zip(test_lons, test_lats)],
+                        dtype=float,
+                    )
+                else:
+                    sig_pred = np.array(
+                        [float(model.predict_signal(cid, lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)],
+                        dtype=float,
+                    )
                 pred_signal_s = time.perf_counter() - t0
                 cached_predictions.append((vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s))
                 print(
@@ -876,6 +887,16 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Fitting Kriging...")
                 train_m = preprocess_for_method(train_df, method_cfg)
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    train_m = train_m.copy()
+                    train_m["cell_id"] = 0
+                    max_train_global = int(method_cfg.get("max_train_global", 2000))
+                    if max_train_global > 0 and len(train_m) > max_train_global:
+                        train_m = train_m.sample(
+                            n=max_train_global,
+                            random_state=int(method_cfg.get("random_state", 42)),
+                        ).reset_index(drop=True)
                 model = KrigingCoverageModel(
                     min_samples=int(method_cfg["min_samples"]),
                     variogram_model=str(method_cfg.get("variogram_model", "spherical")),
@@ -900,8 +921,12 @@ def run_all_methods(
             for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=np.nan, dtype=float)
-                for cell_id, idx in test_groups:
-                    sig_pred[idx] = model.predict_signal(cell_id, test_lons[idx], test_lats[idx])
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    sig_pred[:] = model.predict_signal(0, test_lons, test_lats)
+                else:
+                    for cell_id, idx in test_groups:
+                        sig_pred[idx] = model.predict_signal(cell_id, test_lons[idx], test_lats[idx])
                 pred_signal_s = time.perf_counter() - t0
                 cached_predictions.append(
                     (vidx, method_cfg, method_group, fit_s, n_train_used, sig_pred, pred_signal_s)
@@ -938,6 +963,10 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Fitting IDW...")
                 train_m = preprocess_for_method(train_df, method_cfg)
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    train_m = train_m.copy()
+                    train_m["cell_id"] = 0
                 model = IDWCoverageModel(
                     min_samples=int(method_cfg["min_samples"]),
                     k_neighbors=int(method_cfg.get("k_neighbors", 12)),
@@ -954,9 +983,13 @@ def run_all_methods(
             for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
-                for cell_id, idx in test_df.groupby("cell_id").groups.items():
-                    idx = np.asarray(list(idx), dtype=int)
-                    sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    sig_pred[:] = model.predict_signal(0, test_lons, test_lats)
+                else:
+                    for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                        idx = np.asarray(list(idx), dtype=int)
+                        sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
                 summaries.append(
@@ -1002,8 +1035,11 @@ def run_all_methods(
                 else:
                     feature_cols = ["lon", "lat"]
                 predict_progress_every = int(method_cfg.get("predict_progress_every", 50))
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
                 print(f"[{method_label}][v{vidx}] Fitting ML regressor... features={feature_set}:{','.join(feature_cols)}")
                 train_m = base_train_m.copy()
+                if scope == "global":
+                    train_m["cell_id"] = 0
                 model = MLSignalModel(
                     min_samples=int(method_cfg["min_samples"]),
                     model=str(method_cfg.get("model", "rf")),
@@ -1034,12 +1070,15 @@ def run_all_methods(
 
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
-                for gidx, (cell_id, idx) in enumerate(groups, start=1):
-                    idx = np.asarray(list(idx), dtype=int)
-                    pred = model.predict_on_frame(int(cell_id), test_df.iloc[idx][feature_cols]).astype(float)
-                    sig_pred[idx] = pred
-                    if gidx % predict_progress_every == 0 or gidx == total_groups:
-                        print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")
+                if scope == "global":
+                    sig_pred[:] = model.predict_on_frame(0, test_df[feature_cols]).astype(float)
+                else:
+                    for gidx, (cell_id, idx) in enumerate(groups, start=1):
+                        idx = np.asarray(list(idx), dtype=int)
+                        pred = model.predict_on_frame(int(cell_id), test_df.iloc[idx][feature_cols]).astype(float)
+                        sig_pred[idx] = pred
+                        if gidx % predict_progress_every == 0 or gidx == total_groups:
+                            print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
                 summaries.append(
@@ -1067,6 +1106,10 @@ def run_all_methods(
                 print(f"[{method_label}][v{vidx}] Fitting GPR...")
                 train_m = preprocess_for_method(train_df, method_cfg)
                 print(f"[{method_label}][v{vidx}] Train rows after outlier filter: {len(train_m)}")
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    train_m = train_m.copy()
+                    train_m["cell_id"] = 0
                 model = GPRCoverageModel(
                     min_samples=int(method_cfg["min_samples"]),
                     length_scale=float(method_cfg.get("length_scale", 0.001)),
@@ -1087,9 +1130,13 @@ def run_all_methods(
             for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
-                for cell_id, idx in test_df.groupby("cell_id").groups.items():
-                    idx = np.asarray(list(idx), dtype=int)
-                    sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
+                scope = str(method_cfg.get("scope", "per_cell")).lower()
+                if scope == "global":
+                    sig_pred[:] = model.predict_signal(0, test_lons, test_lats)
+                else:
+                    for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                        idx = np.asarray(list(idx), dtype=int)
+                        sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
                 summaries.append(

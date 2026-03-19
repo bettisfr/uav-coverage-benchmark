@@ -1,0 +1,2 @@
+method,method_group,variant,mae,rmse,r2,pearson,spearman,n_valid,n_train_global,n_train_used,n_test,fit_seconds,predict_seconds,total_seconds,param_min_samples,param_length_scale,param_noise_level,param_alpha,param_normalize_y,param_max_train,param_random_state,param_outlier_strategy,param_outlier_mad_k,param_outlier_min_keep,repeat_id
+5_gpr_v1,5_gpr,1,4.673922877486307,6.508130411077558,0.6221996120780796,0.7923218087533282,0.7659655813902786,47642,111541,101044,47783,21.380933247999565,0.7299588410005526,22.110892089000117,8,0.001,1.0,1e-06,True,300,42,mad,3.5,8,0

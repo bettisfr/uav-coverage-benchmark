@@ -1,0 +1,2 @@
+method,method_group,variant,mae,rmse,r2,pearson,spearman,n_valid,n_train_global,n_train_used,n_test,fit_seconds,predict_seconds,total_seconds,param_min_samples,param_alpha,param_outlier_strategy,param_outlier_percentile,param_outlier_mad_k,param_outlier_dbscan_eps,param_outlier_dbscan_min_samples,param_outlier_min_keep,repeat_id
+1_alpha_shape_v1,1_alpha_shape,1,5.990057643362363,7.5738925194816975,0.4791295744627837,0.6924410953601139,0.6620237410799756,36992,111541,108889,47783,9.50527926399991,1.2722069169994938,10.777486180999404,4,0.01,percentile,98.0,3.5,0.0007,5,4,0
