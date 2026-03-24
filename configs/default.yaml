@@ -69,12 +69,14 @@ methods:
       mad_k: 3.5
       min_keep: 8
   ml:
+    scope: global
     min_samples: 20
-    feature_set: enriched
+    feature_set: global_poly
+    model: rf
     random_state: 42
-    n_estimators: 120
-    max_depth: 12
-    min_samples_leaf: 3
+    n_estimators: 600
+    max_depth: null
+    min_samples_leaf: 1
     min_samples_split: 2
     fit_progress_every: 50
     predict_progress_every: 50

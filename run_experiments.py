@@ -1022,24 +1022,118 @@ def run_all_methods(
             total_groups = len(groups)
             for vidx, method_cfg, base_train_m in preprocessed_train:
                 feature_set = str(method_cfg.get("feature_set", "baseline")).lower()
-                if feature_set == "enriched":
-                    feature_cols = [
-                        c
-                        for c in [
-                            "dist_bs_m",
-                        ]
-                        if c in base_train_m.columns and c in test_df.columns
-                    ]
-                    if len(feature_cols) < 1:
-                        feature_cols = ["lon", "lat"]
-                else:
-                    feature_cols = ["lon", "lat"]
-                predict_progress_every = int(method_cfg.get("predict_progress_every", 50))
                 scope = str(method_cfg.get("scope", "per_cell")).lower()
+
+                train_work = base_train_m.copy()
+                test_work = test_df.copy()
+
+                # Optional engineered features for ML-only experiments.
+                for frame in (train_work, test_work):
+                    if "dist_bs_m" in frame.columns:
+                        d = pd.to_numeric(frame["dist_bs_m"], errors="coerce").astype(float)
+                        d = d.clip(lower=0.0)
+                        frame["dist_bs_km"] = d / 1000.0
+                        frame["dist_bs_log"] = np.log1p(d)
+                        frame["dist_bs_sq"] = d * d
+                    if {"lat", "lon", "bs_lat", "bs_lon"}.issubset(frame.columns):
+                        lat = pd.to_numeric(frame["lat"], errors="coerce").astype(float)
+                        lon = pd.to_numeric(frame["lon"], errors="coerce").astype(float)
+                        bslat = pd.to_numeric(frame["bs_lat"], errors="coerce").astype(float)
+                        bslon = pd.to_numeric(frame["bs_lon"], errors="coerce").astype(float)
+                        dlat = lat - bslat
+                        dlon = lon - bslon
+                        bearing = np.arctan2(dlon, dlat)
+                        frame["bearing_sin"] = np.sin(bearing)
+                        frame["bearing_cos"] = np.cos(bearing)
+                    if {"delta_alt_m", "dist_bs_km"}.issubset(frame.columns):
+                        da = pd.to_numeric(frame["delta_alt_m"], errors="coerce").astype(float)
+                        dk = pd.to_numeric(frame["dist_bs_km"], errors="coerce").astype(float)
+                        frame["delta_alt_x_dist"] = da * dk
+                    if {"bs_band_num", "dist_bs_km"}.issubset(frame.columns):
+                        bb = pd.to_numeric(frame["bs_band_num"], errors="coerce").astype(float)
+                        dk = pd.to_numeric(frame["dist_bs_km"], errors="coerce").astype(float)
+                        frame["band_x_dist"] = bb * dk
+
+                # Keep original cell identity as feature when requested, even in global scope.
+                if "cell_id" in train_work.columns:
+                    train_work["cell_id_feat"] = pd.to_numeric(train_work["cell_id"], errors="coerce")
+                if "cell_id" in test_work.columns:
+                    test_work["cell_id_feat"] = pd.to_numeric(test_work["cell_id"], errors="coerce")
+
+                feature_candidates = {
+                    "baseline": ["lon", "lat"],
+                    # historical "enriched" kept for backward compatibility
+                    "enriched": ["lon", "lat", "dist_bs_m", "delta_alt_m"],
+                    "dist_only": ["dist_bs_m"],
+                    "geo_dist_alt": ["lon", "lat", "dist_bs_m", "delta_alt_m"],
+                    "bs_context": [
+                        "lon",
+                        "lat",
+                        "dist_bs_m",
+                        "delta_alt_m",
+                        "bs_lat",
+                        "bs_lon",
+                        "bs_is_5g",
+                        "bs_has_dss",
+                        "bs_band_num",
+                        "bs_sector_num",
+                    ],
+                    # Strong global setting: add cell identity as numeric feature.
+                    "global_strong": [
+                        "lon",
+                        "lat",
+                        "dist_bs_m",
+                        "dist_bs_log",
+                        "dist_bs_sq",
+                        "dist_bs_km",
+                        "delta_alt_m",
+                        "delta_alt_x_dist",
+                        "bs_lat",
+                        "bs_lon",
+                        "bearing_sin",
+                        "bearing_cos",
+                        "bs_is_5g",
+                        "bs_has_dss",
+                        "bs_band_num",
+                        "bs_sector_num",
+                        "band_x_dist",
+                        "cell_id_feat",
+                    ],
+                    # One-shot richer global feature set for fast experimentation.
+                    "global_poly": [
+                        "lon",
+                        "lat",
+                        "dist_bs_m",
+                        "dist_bs_log",
+                        "dist_bs_sq",
+                        "dist_bs_km",
+                        "delta_alt_m",
+                        "delta_alt_x_dist",
+                        "bs_lat",
+                        "bs_lon",
+                        "bearing_sin",
+                        "bearing_cos",
+                        "bs_is_5g",
+                        "bs_has_dss",
+                        "bs_band_num",
+                        "bs_sector_num",
+                        "band_x_dist",
+                        "cell_id_feat",
+                    ],
+                }
+                wanted = feature_candidates.get(feature_set, feature_candidates["baseline"])
+                feature_cols = [c for c in wanted if c in train_work.columns and c in test_work.columns]
+                if len(feature_cols) < 1:
+                    feature_cols = ["lon", "lat"]
+
+                predict_progress_every = int(method_cfg.get("predict_progress_every", 50))
                 print(f"[{method_label}][v{vidx}] Fitting ML regressor... features={feature_set}:{','.join(feature_cols)}")
-                train_m = base_train_m.copy()
+                train_m = train_work
                 if scope == "global":
-                    train_m["cell_id"] = 0
+                    train_m["_model_group"] = 0
+                    cell_col_fit = "_model_group"
+                else:
+                    cell_col_fit = "cell_id"
                 model = MLSignalModel(
                     min_samples=int(method_cfg["min_samples"]),
                     model=str(method_cfg.get("model", "rf")),
@@ -1056,7 +1150,7 @@ def run_all_methods(
                 t0 = time.perf_counter()
                 model.fit(
                     train_m,
-                    "cell_id",
+                    cell_col_fit,
                     "lon",
                     "lat",
                     "signal",
@@ -1071,11 +1165,11 @@ def run_all_methods(
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
                 if scope == "global":
-                    sig_pred[:] = model.predict_on_frame(0, test_df[feature_cols]).astype(float)
+                    sig_pred[:] = model.predict_on_frame(0, test_work[feature_cols]).astype(float)
                 else:
                     for gidx, (cell_id, idx) in enumerate(groups, start=1):
                         idx = np.asarray(list(idx), dtype=int)
-                        pred = model.predict_on_frame(int(cell_id), test_df.iloc[idx][feature_cols]).astype(float)
+                        pred = model.predict_on_frame(int(cell_id), test_work.iloc[idx][feature_cols]).astype(float)
                         sig_pred[idx] = pred
                         if gidx % predict_progress_every == 0 or gidx == total_groups:
                             print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")

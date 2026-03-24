@@ -1,0 +1,40 @@
+data:
+  root_dir: data/connectivity
+  skip_ocid: true
+  measurement_features_csv: data/connectivity/derived/measurement_altitudes_dem.csv
+  bs_features_csv: data/connectivity/derived/bs_altitudes_dem_matched.csv
+
+preprocess:
+  min_signal_dbm: -150
+  max_signal_dbm: -30
+  min_total_samples_per_cell: 10
+  signal_threshold_dbm: [-105, -110, -115, -120]
+
+split:
+  strategy: random
+  test_fraction: 0.3
+  random_state: 42
+
+methods:
+  ml:
+    scope: global
+    min_samples: 20
+    feature_set: global_poly
+    model: rf
+    random_state: 42
+    n_estimators: 300
+    max_depth: 20
+    min_samples_leaf: 3
+    min_samples_split: 2
+    fit_progress_every: 100
+    predict_progress_every: 200
+    outlier:
+      strategy: none
+      min_keep: 20
+
+experiment:
+  max_cells: null
+
+output:
+  summary_csv: results/metrics/metrics_summary_ml_global_poly_once.csv
+  split_info_csv: results/metrics/split_info_ml_global_poly_once.csv

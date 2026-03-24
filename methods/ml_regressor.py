@@ -122,7 +122,7 @@ class MLSignalModel:
     def _prepare_x(self, frame, feature_cols, feature_medians: Optional[Dict[str, float]] = None):
         xdf = frame[feature_cols].copy()
         for c in feature_cols:
-            arr = np.asarray(xdf[c], dtype=float)
+            arr = pd.to_numeric(xdf[c], errors="coerce").to_numpy(dtype=float)
             if feature_medians is not None and c in feature_medians:
                 med = float(feature_medians[c])
             else:
@@ -155,9 +155,16 @@ class MLSignalModel:
                 self.models[int(cell_id)] = CellModel(model=None, constant_value=float("-inf"), feature_medians={})
                 continue
 
-            g = group[cols + [signal_col]].dropna(subset=cols + [signal_col])
-            y = g[signal_col].astype(float).to_numpy()
-            feature_medians = {c: float(g[c].astype(float).median()) for c in cols}
+            # Keep rows with missing features (they are imputed in _prepare_x),
+            # drop only rows with missing target signal.
+            g = group[cols + [signal_col]].dropna(subset=[signal_col])
+            y = pd.to_numeric(g[signal_col], errors="coerce").to_numpy(dtype=float)
+            y = y[np.isfinite(y)]
+            feature_medians = {}
+            for c in cols:
+                vc = pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=float)
+                finite = vc[np.isfinite(vc)]
+                feature_medians[c] = float(np.median(finite)) if finite.size > 0 else 0.0
             x = self._prepare_x(g, self.feature_cols, feature_medians=feature_medians)
 
             if len(g) < self.min_samples:
