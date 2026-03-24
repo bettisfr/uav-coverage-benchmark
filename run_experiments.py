@@ -364,6 +364,51 @@ def _evaluate_regression(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, fl
     }
 
 
+def _evaluate_coverage_from_signal(y_true: np.ndarray, y_pred: np.ndarray, threshold_dbm: float) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    n_valid = int(np.sum(mask))
+    if n_valid == 0:
+        return {
+            "tp": 0,
+            "fp": 0,
+            "tn": 0,
+            "fn": 0,
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "accuracy": float("nan"),
+            "n_valid": 0,
+        }
+
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    ytb = yt >= float(threshold_dbm)
+    ypb = yp >= float(threshold_dbm)
+
+    tp = int(np.sum(ypb & ytb))
+    fp = int(np.sum(ypb & (~ytb)))
+    tn = int(np.sum((~ypb) & (~ytb)))
+    fn = int(np.sum((~ypb) & ytb))
+
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    f1 = float((2.0 * precision * recall) / (precision + recall)) if (precision + recall) > 0 else 0.0
+    accuracy = float((tp + tn) / n_valid) if n_valid > 0 else float("nan")
+    return {
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": accuracy,
+        "n_valid": n_valid,
+    }
+
+
 def _flatten_params(prefix: str, obj) -> Dict[str, object]:
     out = {}
     if isinstance(obj, dict):
@@ -435,6 +480,48 @@ def _method_summary(
     return metrics
 
 
+def _method_coverage_summaries(
+    base_row: Dict[str, object],
+    y_true_signal: np.ndarray,
+    y_pred_signal: np.ndarray,
+    thresholds_dbm: List[float],
+) -> List[Dict[str, object]]:
+    keep_keys = [
+        "method",
+        "method_group",
+        "variant",
+        "n_train_global",
+        "n_train_used",
+        "n_test",
+        "fit_seconds",
+        "predict_seconds",
+        "total_seconds",
+    ]
+    keep_keys.extend([k for k in base_row.keys() if str(k).startswith("param_")])
+    prefix = {k: base_row.get(k) for k in keep_keys if k in base_row}
+
+    rows: List[Dict[str, object]] = []
+    for tau in thresholds_dbm:
+        m = _evaluate_coverage_from_signal(y_true_signal, y_pred_signal, float(tau))
+        row = dict(prefix)
+        row.update(
+            {
+                "threshold_dbm": float(tau),
+                "tp": int(m["tp"]),
+                "fp": int(m["fp"]),
+                "tn": int(m["tn"]),
+                "fn": int(m["fn"]),
+                "precision": float(m["precision"]),
+                "recall": float(m["recall"]),
+                "f1": float(m["f1"]),
+                "accuracy": float(m["accuracy"]),
+                "n_valid": int(m["n_valid"]),
+            }
+        )
+        rows.append(row)
+    return rows
+
+
 def _order_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -461,8 +548,41 @@ def _order_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df[ordered + rest]
 
 
+def _order_coverage_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    first_cols = [
+        "method",
+        "method_group",
+        "variant",
+        "threshold_dbm",
+        "precision",
+        "recall",
+        "f1",
+        "accuracy",
+        "tp",
+        "fp",
+        "tn",
+        "fn",
+        "n_valid",
+        "n_train_global",
+        "n_train_used",
+        "n_test",
+        "fit_seconds",
+        "predict_seconds",
+        "total_seconds",
+    ]
+    ordered = [c for c in first_cols if c in df.columns]
+    rest = [c for c in df.columns if c not in ordered]
+    return df[ordered + rest]
+
+
 def _format_summary_for_output(df: pd.DataFrame) -> pd.DataFrame:
     return _order_summary_columns(df.copy())
+
+
+def _format_coverage_for_output(df: pd.DataFrame) -> pd.DataFrame:
+    return _order_coverage_columns(df.copy())
 
 
 def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
@@ -515,6 +635,50 @@ def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
 
     # Keep a stable column order.
     out = _order_summary_columns(out)
+    std_cols = [c for c in out.columns if c.endswith("_std")]
+    base_cols = [c for c in out.columns if c not in std_cols]
+    return out[base_cols + std_cols]
+
+
+def _aggregate_repeated_coverages(coverage_raw: pd.DataFrame) -> pd.DataFrame:
+    if coverage_raw.empty:
+        return coverage_raw
+    if "repeat_id" not in coverage_raw.columns:
+        return coverage_raw
+
+    group_cols = [
+        c
+        for c in coverage_raw.columns
+        if c
+        in {
+            "method",
+            "method_group",
+            "variant",
+            "threshold_dbm",
+            "n_train_global",
+            "n_train_used",
+            "n_test",
+        }
+        or c.startswith("param_")
+    ]
+    group_cols = [c for c in group_cols if c in coverage_raw.columns]
+
+    metric_cols = [
+        c
+        for c in ["precision", "recall", "f1", "accuracy", "tp", "fp", "tn", "fn", "n_valid", "fit_seconds", "predict_seconds", "total_seconds"]
+        if c in coverage_raw.columns
+    ]
+
+    grouped = coverage_raw.groupby(group_cols, dropna=False, as_index=False)
+    mean_df = grouped[metric_cols].mean(numeric_only=True)
+    out = mean_df.copy()
+    out["n_repeats"] = grouped.size()["size"]
+
+    std_df = grouped[metric_cols].std(numeric_only=True, ddof=0).fillna(0.0)
+    for c in metric_cols:
+        out[f"{c}_std"] = std_df[c]
+
+    out = _order_coverage_columns(out)
     std_cols = [c for c in out.columns if c.endswith("_std")]
     base_cols = [c for c in out.columns if c not in std_cols]
     return out[base_cols + std_cols]
@@ -577,6 +741,47 @@ def print_compact_summary(summary: pd.DataFrame) -> None:
         }
     )
     print(compact.to_string(index=False))
+
+
+def print_compact_coverage(coverage: pd.DataFrame) -> None:
+    if coverage.empty:
+        print("No coverage rows.")
+        return
+
+    preferred_cols = [
+        "method",
+        "method_group",
+        "variant",
+        "threshold_dbm",
+        "precision",
+        "recall",
+        "f1",
+        "accuracy",
+        "tp",
+        "fp",
+        "tn",
+        "fn",
+        "n_valid",
+    ]
+    cols = [c for c in preferred_cols if c in coverage.columns]
+    compact = coverage[cols].sort_values(by=["threshold_dbm", "f1"], ascending=[False, False]).copy()
+    compact = compact.rename(
+        columns={
+            "threshold_dbm": "tau_dbm",
+            "precision": "prec",
+            "recall": "rec",
+            "accuracy": "acc",
+        }
+    )
+    print(compact.to_string(index=False))
+
+
+def derive_coverage_output_path(summary_path: str) -> str:
+    base, ext = os.path.splitext(summary_path)
+    ext = ext or ".csv"
+    if "metrics_summary" in base:
+        return base.replace("metrics_summary", "coverage_summary") + ext
+    return f"{base}_coverage{ext}"
 
 
 def save_per_method_csv(summary: pd.DataFrame, summary_path: str) -> List[str]:
@@ -662,6 +867,15 @@ def clear_output_files(summary_path: str, split_path: str, methods_to_run: List[
             if os.path.exists(p):
                 os.remove(p)
 
+    coverage_path = derive_coverage_output_path(summary_path)
+    cbase, cext = os.path.splitext(coverage_path)
+    cext = cext or ".csv"
+    for mk in selected:
+        for suffix in method_name_map.get(mk, []):
+            p = f"{cbase}_{suffix}{cext}"
+            if os.path.exists(p):
+                os.remove(p)
+
 
 def _outlier_cfg(method_cfg: dict) -> dict:
     return method_cfg.get("outlier", {"strategy": "none"})
@@ -726,7 +940,8 @@ def run_all_methods(
     cfg: dict,
     methods_to_run: List[str] | None = None,
     summary_path_for_checkpoints: str | None = None,
-) -> pd.DataFrame:
+    coverage_path_for_checkpoints: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     test_df = test_df.reset_index(drop=True)
     mcfg = cfg["methods"]
     methods_set = set(methods_to_run or ["convex_hull", "alpha_shape", "kriging", "idw", "gpr", "ml"])
@@ -736,8 +951,10 @@ def run_all_methods(
     test_lats = test_df["lat"].to_numpy(dtype=float)
     y_true_signal = test_df["signal"].to_numpy(dtype=float)
     n_train_global = int(len(train_df))
+    thresholds_dbm = [float(x) for x in cfg.get("preprocess", {}).get("signal_threshold_dbm", [-105, -110, -115, -120])]
 
     summaries = []
+    coverage_rows = []
     method_sequence = [
         ("convex_hull", "CONVEX_HULL"),
         ("alpha_shape", "ALPHA_SHAPE"),
@@ -802,8 +1019,7 @@ def run_all_methods(
                 )
 
             for vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -815,8 +1031,11 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=n_train_used,
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Convex Hull-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "alpha_shape":
@@ -862,8 +1081,7 @@ def run_all_methods(
                 )
 
             for vidx, method_cfg, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -875,8 +1093,11 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=n_train_used,
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Alpha-Shape-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "kriging":
@@ -938,8 +1159,7 @@ def run_all_methods(
 
             for vidx, method_cfg, method_group, fit_s, n_train_used, sig_pred, pred_signal_s in cached_predictions:
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -951,8 +1171,11 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=n_train_used,
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Kriging regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "idw":
@@ -992,8 +1215,7 @@ def run_all_methods(
                         sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -1005,8 +1227,11 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=n_train_used,
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done IDW regression (pred={pred_s:.3f}s)")
 
         elif method_key == "ml":
@@ -1175,8 +1400,7 @@ def run_all_methods(
                             print(f"[{method_label}][v{vidx}] ML predict progress: {gidx}/{total_groups} cells")
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -1188,8 +1412,11 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=int(len(base_train_m)),
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done ML{suffix} regression (fit={fit_s:.3f}s, pred={pred_s:.3f}s)")
 
         elif method_key == "gpr":
@@ -1233,8 +1460,7 @@ def run_all_methods(
                         sig_pred[idx] = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
                 pred_s = time.perf_counter() - t0
                 sig_pred_clean = np.where(np.isnan(sig_pred), float("-inf"), sig_pred)
-                summaries.append(
-                    _method_summary(
+                row = _method_summary(
                         f"{method_group}_v{vidx}",
                         method_group,
                         vidx,
@@ -1246,15 +1472,18 @@ def run_all_methods(
                         n_train_global=n_train_global,
                         n_train_used=n_train_used,
                     )
-                )
-                append_per_method_csv_rows(pd.DataFrame([summaries[-1]]), summary_path_for_checkpoints or "")
+                summaries.append(row)
+                coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
+                if coverage_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done GPR regression (pred={pred_s:.3f}s)")
 
         # Method-level checkpoint save
         if summary_path_for_checkpoints:
             print("[CHECKPOINT] Method completed (rows already appended).")
 
-    return pd.DataFrame(summaries)
+    return pd.DataFrame(summaries), pd.DataFrame(coverage_rows)
 
 def main():
     parser = argparse.ArgumentParser(description="Coverage benchmark runner")
@@ -1309,8 +1538,9 @@ def main():
     df = apply_common_filters(df, cfg)
     print(f"[INIT] Rows after filters: {len(df)} | cells: {df['cell_id'].nunique() if not df.empty else 0}")
     out_summary = _append_tag_to_path(cfg["output"]["summary_csv"], args.run_tag.strip() or None)
+    out_coverage = derive_coverage_output_path(out_summary)
     out_split = _append_tag_to_path(cfg["output"]["split_info_csv"], args.run_tag.strip() or None)
-    for out_path in [out_summary, out_split]:
+    for out_path in [out_summary, out_coverage, out_split]:
         out_dir = os.path.dirname(out_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -1328,6 +1558,7 @@ def main():
     print(f"[INIT] Split strategy={strategy} | repeats={repeats} | n_splits={n_splits} | base_seed={base_seed}")
 
     all_summaries = []
+    all_coverages = []
     split_rows = []
 
     split_jobs: List[tuple[int, pd.DataFrame, pd.DataFrame, dict]] = []
@@ -1360,18 +1591,23 @@ def main():
         if strategy == "random":
             cfg_rep.setdefault("split", {})["random_state"] = base_seed + ridx
 
-        summary_r = run_all_methods(
+        summary_r, coverage_r = run_all_methods(
             train_df,
             test_df,
             cfg_rep,
             methods_to_run=methods_to_run,
             # For repeated runs we aggregate at the end; avoid mixed per-row checkpoint appends.
             summary_path_for_checkpoints=(out_summary if total_runs == 1 else None),
+            coverage_path_for_checkpoints=(out_coverage if total_runs == 1 else None),
         )
         if not summary_r.empty:
             summary_r = summary_r.copy()
             summary_r["repeat_id"] = int(ridx)
             all_summaries.append(summary_r)
+        if not coverage_r.empty:
+            coverage_r = coverage_r.copy()
+            coverage_r["repeat_id"] = int(ridx)
+            all_coverages.append(coverage_r)
 
         split_rows.append(
             {
@@ -1395,9 +1631,17 @@ def main():
 
     summary_raw = pd.concat(all_summaries, ignore_index=True)
     summary = _aggregate_repeated_summaries(summary_raw) if total_runs > 1 else summary_raw
+    coverage_raw = pd.concat(all_coverages, ignore_index=True) if all_coverages else pd.DataFrame()
+    coverage = _aggregate_repeated_coverages(coverage_raw) if (total_runs > 1 and not coverage_raw.empty) else coverage_raw
     print("[SAVE] Writing summary...")
     summary = _format_summary_for_output(summary)
     per_method_paths = save_per_method_csv(summary, out_summary)
+    if not coverage.empty:
+        print("[SAVE] Writing coverage summary...")
+        coverage = _format_coverage_for_output(coverage)
+        per_method_cov_paths = save_per_method_csv(coverage, out_coverage)
+    else:
+        per_method_cov_paths = []
 
     split_info = pd.DataFrame(split_rows)
     print("[SAVE] Writing split info...")
@@ -1407,9 +1651,16 @@ def main():
         print("Saved per-method CSV files:")
         for p in per_method_paths:
             print(f" - {p}")
+    if per_method_cov_paths:
+        print("Saved per-method coverage CSV files:")
+        for p in per_method_cov_paths:
+            print(f" - {p}")
     print(f"Saved split info to {out_split}")
     print("[RESULT] Compact table (sorted by RMSE):")
     print_compact_summary(summary)
+    if not coverage.empty:
+        print("[RESULT] Compact coverage table (sorted by tau,f1):")
+        print_compact_coverage(coverage)
 
 
 if __name__ == "__main__":
