@@ -62,7 +62,7 @@ methods:
     noise_level: 1.0
     alpha: 1.0e-6
     normalize_y: true
-    max_train: 300
+    max_train: 400
     random_state: 42
     outlier:
       strategy: mad

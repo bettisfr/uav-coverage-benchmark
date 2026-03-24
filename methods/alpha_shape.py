@@ -14,6 +14,7 @@ class CellModel:
     polygon: Optional[Polygon]
     beta0: float
     beta1: float
+    beta2: float
     signal_mean: float
     feature_mode: str
     ref_lon: float
@@ -47,6 +48,29 @@ class AlphaShapeCoverageModel:
         beta, *_ = np.linalg.lstsq(a, y, rcond=None)
         return float(beta[0]), float(beta[1])
 
+    def _fit_quadratic(self, x: np.ndarray, y: np.ndarray) -> tuple[float, float, float]:
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if len(x) < 2:
+            return float(np.nanmean(y)) if len(y) else float("-inf"), 0.0, 0.0
+        if np.nanstd(x) <= 1e-12:
+            return float(np.nanmean(y)), 0.0, 0.0
+
+        uniq_x = np.unique(np.round(x, 6))
+        if len(uniq_x) >= 3:
+            a = np.column_stack([np.ones(len(x)), x, x * x])
+            try:
+                beta, *_ = np.linalg.lstsq(a, y, rcond=None)
+                return float(beta[0]), float(beta[1]), float(beta[2])
+            except Exception:
+                pass
+
+        b0, b1 = self._fit_linear(x, y)
+        return b0, b1, 0.0
+
     def fit(
         self,
         df,
@@ -68,6 +92,7 @@ class AlphaShapeCoverageModel:
                     polygon=poly,
                     beta0=float("-inf"),
                     beta1=0.0,
+                    beta2=0.0,
                     signal_mean=float("-inf"),
                     feature_mode="none",
                     ref_lon=float("nan"),
@@ -112,14 +137,15 @@ class AlphaShapeCoverageModel:
                     feature_mode = "centroid_distance"
 
             if feat is None:
-                beta0, beta1 = signal_mean, 0.0
+                beta0, beta1, beta2 = signal_mean, 0.0, 0.0
             else:
-                beta0, beta1 = self._fit_linear(feat, sig)
+                beta0, beta1, beta2 = self._fit_quadratic(feat, sig)
 
             self.models[int(cell_id)] = CellModel(
                 polygon=poly,
                 beta0=beta0,
                 beta1=beta1,
+                beta2=beta2,
                 signal_mean=signal_mean,
                 feature_mode=feature_mode,
                 ref_lon=ref_lon,
@@ -140,10 +166,10 @@ class AlphaShapeCoverageModel:
             return float("-inf")
         if model.feature_mode in {"bs_distance", "centroid_distance"}:
             d = float(self._haversine_m(np.array([lon], dtype=float), np.array([lat], dtype=float), model.ref_lon, model.ref_lat)[0])
-            return float(model.beta0 + model.beta1 * d)
+            return float(model.beta0 + model.beta1 * d + model.beta2 * d * d)
         if model.feature_mode == "dist_col":
             d = float(self._haversine_m(np.array([lon], dtype=float), np.array([lat], dtype=float), model.ref_lon, model.ref_lat)[0])
-            return float(model.beta0 + model.beta1 * d)
+            return float(model.beta0 + model.beta1 * d + model.beta2 * d * d)
         return float(model.signal_mean)
 
     def _build_alpha_shape(self, points: np.ndarray) -> Optional[Polygon]:
