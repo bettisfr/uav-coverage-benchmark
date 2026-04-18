@@ -1,0 +1,34 @@
+data:
+  root_dir: data/connectivity
+  skip_ocid: true
+  measurement_features_csv: data/connectivity/derived/measurement_altitudes_dem.csv
+  bs_features_csv: data/connectivity/derived/bs_altitudes_dem_matched.csv
+
+preprocess:
+  min_signal_dbm: -150
+  max_signal_dbm: -30
+  min_total_samples_per_cell: 10
+  signal_threshold_dbm: [-105, -110, -115, -120]
+
+split:
+  strategy: random
+  test_fraction: 0.3
+  random_state: 42
+
+methods:
+  idw:
+    min_samples: 4
+    k_neighbors: [24, 32]
+    power: [1.0, 1.5]
+    epsilon: 1.0e-12
+    outlier:
+      strategy: mad
+      mad_k: 2.5
+      min_keep: 6
+
+experiment:
+  max_cells: null
+
+output:
+  summary_csv: results/metrics/metrics_summary_idw_tune_4.csv
+  split_info_csv: results/metrics/split_info_idw_tune_4.csv

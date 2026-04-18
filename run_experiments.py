@@ -5,6 +5,7 @@ import copy
 import glob
 import itertools
 import os
+import pickle
 import time
 from typing import Dict, List
 
@@ -407,6 +408,240 @@ def _evaluate_coverage_from_signal(y_true: np.ndarray, y_pred: np.ndarray, thres
         "accuracy": accuracy,
         "n_valid": n_valid,
     }
+
+
+def _prepare_ml_frame_for_eval(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if "dist_bs_m" in out.columns:
+        d = pd.to_numeric(out["dist_bs_m"], errors="coerce").astype(float)
+        d = d.clip(lower=0.0)
+        out["dist_bs_km"] = d / 1000.0
+        out["dist_bs_log"] = np.log1p(d)
+        out["dist_bs_sq"] = d * d
+    if {"lat", "lon", "bs_lat", "bs_lon"}.issubset(out.columns):
+        lat = pd.to_numeric(out["lat"], errors="coerce").astype(float)
+        lon = pd.to_numeric(out["lon"], errors="coerce").astype(float)
+        bslat = pd.to_numeric(out["bs_lat"], errors="coerce").astype(float)
+        bslon = pd.to_numeric(out["bs_lon"], errors="coerce").astype(float)
+        dlat = lat - bslat
+        dlon = lon - bslon
+        bearing = np.arctan2(dlon, dlat)
+        out["bearing_sin"] = np.sin(bearing)
+        out["bearing_cos"] = np.cos(bearing)
+    if {"delta_alt_m", "dist_bs_km"}.issubset(out.columns):
+        da = pd.to_numeric(out["delta_alt_m"], errors="coerce").astype(float)
+        dk = pd.to_numeric(out["dist_bs_km"], errors="coerce").astype(float)
+        out["delta_alt_x_dist"] = da * dk
+    if {"bs_band_num", "dist_bs_km"}.issubset(out.columns):
+        bb = pd.to_numeric(out["bs_band_num"], errors="coerce").astype(float)
+        dk = pd.to_numeric(out["dist_bs_km"], errors="coerce").astype(float)
+        out["band_x_dist"] = bb * dk
+    if "cell_id" in out.columns:
+        out["cell_id_feat"] = pd.to_numeric(out["cell_id"], errors="coerce")
+    return out
+
+
+def evaluate_saved_models(
+    cfg: dict,
+    models_dir: str,
+    trace_patterns: List[str],
+    thresholds_dbm: List[float],
+    out_prefix: str,
+) -> None:
+    trace_paths: List[str] = []
+    for pat in trace_patterns:
+        trace_paths.extend(glob.glob(pat))
+    trace_paths = sorted(set(trace_paths))
+    if not trace_paths:
+        raise FileNotFoundError("No trace files matched --evaluate-trace patterns.")
+
+    trace_frames = []
+    for path in trace_paths:
+        d = _load_new_csv(path, skip_ocid=False)
+        if not d.empty:
+            trace_frames.append(d)
+    if not trace_frames:
+        raise ValueError("Matched trace files are not compatible Tower CSV exports.")
+
+    test_df = pd.concat(trace_frames, ignore_index=True)
+    for c in ["lat", "lon", "cell_id", "signal"]:
+        test_df[c] = pd.to_numeric(test_df[c], errors="coerce")
+    test_df = test_df.dropna(subset=["lat", "lon", "cell_id", "signal"]).copy()
+    test_df["cell_id"] = test_df["cell_id"].astype(int)
+
+    print(f"[EVAL] Trace rows loaded: {len(test_df)} from {len(trace_paths)} files")
+    test_df = enrich_with_derived_features(test_df, cfg)
+
+    min_signal = float(cfg.get("preprocess", {}).get("min_signal_dbm", -150.0))
+    max_signal = float(cfg.get("preprocess", {}).get("max_signal_dbm", -30.0))
+    test_df = test_df[(test_df["signal"] >= min_signal) & (test_df["signal"] <= max_signal)].copy()
+    test_df = test_df[(test_df["lat"] >= -90) & (test_df["lat"] <= 90) & (test_df["lon"] >= -180) & (test_df["lon"] <= 180)].copy()
+    if test_df.empty:
+        raise ValueError("No rows left in evaluation trace after filters.")
+
+    test_ml = _prepare_ml_frame_for_eval(test_df)
+    y_true = test_df["signal"].to_numpy(dtype=float)
+    test_cells = test_df["cell_id"].to_numpy(dtype=int)
+    test_lons = test_df["lon"].to_numpy(dtype=float)
+    test_lats = test_df["lat"].to_numpy(dtype=float)
+
+    pkl_files = sorted(glob.glob(os.path.join(models_dir, "repeat_*_fold_*", "*.pkl")))
+    if not pkl_files:
+        pkl_files = sorted(glob.glob(os.path.join(models_dir, "*.pkl")))
+    if not pkl_files:
+        raise FileNotFoundError(f"No model artifacts found in {models_dir}")
+
+    short_map = {
+        "0_CH": "CH",
+        "1_alpha_shape": "AS",
+        "2_kriging": "K",
+        "2_kriging_missing_dep": "K",
+        "3_idw": "IDW",
+        "4_ml": "ML",
+        "4_ml_missing_dep": "ML",
+        "5_gpr": "GPR",
+        "5_gpr_missing_dep": "GPR",
+    }
+
+    reg_rows: List[Dict[str, object]] = []
+    cov_rows: List[Dict[str, object]] = []
+
+    for path in pkl_files:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+
+        method_group = str(payload.get("method_group", ""))
+        method = short_map.get(method_group, method_group)
+        split_meta = payload.get("split_meta", {}) or {}
+        model = payload.get("model")
+        extra = payload.get("extra", {}) or {}
+        scope = str(extra.get("scope", "per_cell")).lower()
+
+        if method_group in {"0_CH", "1_alpha_shape"}:
+            if scope == "global":
+                y_pred = np.array([float(model.predict_signal(0, lo, la)) for lo, la in zip(test_lons, test_lats)], dtype=float)
+            else:
+                y_pred = np.array(
+                    [float(model.predict_signal(int(cid), lo, la)) for cid, lo, la in zip(test_cells, test_lons, test_lats)],
+                    dtype=float,
+                )
+        elif method_group in {"2_kriging", "2_kriging_missing_dep", "3_idw", "5_gpr", "5_gpr_missing_dep"}:
+            y_pred = np.full(shape=len(test_df), fill_value=np.nan, dtype=float)
+            if scope == "global":
+                cell_pred = model.predict_signal(0, test_lons, test_lats)
+                y_pred[:] = np.asarray(cell_pred, dtype=float)
+            else:
+                for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                    idx = np.asarray(list(idx), dtype=int)
+                    cell_pred = model.predict_signal(int(cell_id), test_lons[idx], test_lats[idx])
+                    y_pred[idx] = np.asarray(cell_pred, dtype=float)
+            y_pred = np.where(np.isnan(y_pred), float("-inf"), y_pred)
+        elif method_group in {"4_ml", "4_ml_missing_dep"}:
+            feature_cols = extra.get("feature_cols", ["lon", "lat"])
+            if scope == "global":
+                y_pred = np.asarray(model.predict_on_frame(0, test_ml[feature_cols]), dtype=float)
+            else:
+                y_pred = np.full(shape=len(test_df), fill_value=float("-inf"), dtype=float)
+                for cell_id, idx in test_df.groupby("cell_id").groups.items():
+                    idx = np.asarray(list(idx), dtype=int)
+                    y_pred[idx] = np.asarray(model.predict_on_frame(int(cell_id), test_ml.iloc[idx][feature_cols]), dtype=float)
+            y_pred = np.where(np.isnan(y_pred), float("-inf"), y_pred)
+        else:
+            continue
+
+        reg = _evaluate_regression(y_true, y_pred)
+        reg_rows.append(
+            {
+                "method": method,
+                "method_group": method_group,
+                "repeat_id": split_meta.get("repeat_id"),
+                "fold_id": split_meta.get("fold_id"),
+                "mae": float(reg["mae"]),
+                "rmse": float(reg["rmse"]),
+                "r2": float(reg["r2"]),
+                "pearson": float(reg["pearson"]),
+                "spearman": float(reg["spearman"]),
+                "n_valid": int(reg["n_valid"]),
+            }
+        )
+        for tau in thresholds_dbm:
+            cov = _evaluate_coverage_from_signal(y_true, y_pred, float(tau))
+            cov_rows.append(
+                {
+                    "method": method,
+                    "method_group": method_group,
+                    "repeat_id": split_meta.get("repeat_id"),
+                    "fold_id": split_meta.get("fold_id"),
+                    "threshold_dbm": float(tau),
+                    "precision": float(cov["precision"]),
+                    "recall": float(cov["recall"]),
+                    "f1": float(cov["f1"]),
+                    "accuracy": float(cov["accuracy"]),
+                    "tp": int(cov["tp"]),
+                    "fp": int(cov["fp"]),
+                    "tn": int(cov["tn"]),
+                    "fn": int(cov["fn"]),
+                    "n_valid": int(cov["n_valid"]),
+                }
+            )
+
+    if not reg_rows:
+        raise ValueError("No compatible model artifacts were evaluated.")
+
+    reg_df = pd.DataFrame(reg_rows)
+    cov_df = pd.DataFrame(cov_rows)
+
+    reg_agg = (
+        reg_df.groupby("method", as_index=False)
+        .agg(
+            mae=("mae", "mean"),
+            mae_std=("mae", "std"),
+            rmse=("rmse", "mean"),
+            rmse_std=("rmse", "std"),
+            r2=("r2", "mean"),
+            r2_std=("r2", "std"),
+            pearson=("pearson", "mean"),
+            pearson_std=("pearson", "std"),
+            spearman=("spearman", "mean"),
+            spearman_std=("spearman", "std"),
+            n_valid=("n_valid", "mean"),
+        )
+        .sort_values(by="rmse", ascending=True)
+        .reset_index(drop=True)
+    )
+
+    cov_agg = (
+        cov_df.groupby(["method", "threshold_dbm"], as_index=False)
+        .agg(
+            precision=("precision", "mean"),
+            precision_std=("precision", "std"),
+            recall=("recall", "mean"),
+            recall_std=("recall", "std"),
+            f1=("f1", "mean"),
+            f1_std=("f1", "std"),
+            accuracy=("accuracy", "mean"),
+            accuracy_std=("accuracy", "std"),
+            n_valid=("n_valid", "mean"),
+        )
+        .sort_values(by=["threshold_dbm", "f1"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+    out_dir = os.path.dirname(out_prefix)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    out_reg = f"{out_prefix}_regression.csv"
+    out_cov = f"{out_prefix}_coverage.csv"
+    reg_agg.to_csv(out_reg, index=False)
+    cov_agg.to_csv(out_cov, index=False)
+
+    print("[EVAL] Saved evaluation CSVs:")
+    print(f" - {out_reg}")
+    print(f" - {out_cov}")
+    print("[EVAL] Aggregated regression:")
+    print(reg_agg[["method", "mae", "rmse", "r2", "pearson", "spearman"]].round(4).to_string(index=False))
+    print("[EVAL] Aggregated coverage:")
+    print(cov_agg[["method", "threshold_dbm", "precision", "recall", "f1", "accuracy"]].round(4).to_string(index=False))
 
 
 def _flatten_params(prefix: str, obj) -> Dict[str, object]:
@@ -934,6 +1169,37 @@ def preprocess_for_method(train_df: pd.DataFrame, method_cfg: dict) -> pd.DataFr
     return pd.concat(filtered_groups, ignore_index=True)
 
 
+def _save_model_artifact(
+    save_dir: str | None,
+    split_meta: dict | None,
+    method_group: str,
+    variant: int,
+    model_obj,
+    method_cfg: dict,
+    extra: dict | None = None,
+) -> None:
+    if not save_dir:
+        return
+    split_meta = split_meta or {}
+    rep = split_meta.get("repeat_id", "na")
+    fold = split_meta.get("fold_id", "na")
+    split_tag = f"repeat_{rep}_fold_{fold}"
+    out_dir = os.path.join(save_dir, split_tag)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{method_group}_v{int(variant)}.pkl")
+    payload = {
+        "method_group": method_group,
+        "variant": int(variant),
+        "split_meta": dict(split_meta),
+        "method_cfg": copy.deepcopy(method_cfg),
+        "extra": (extra or {}),
+        "model": model_obj,
+    }
+    with open(out_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[SAVE][MODEL] {out_path}")
+
+
 def run_all_methods(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -941,6 +1207,8 @@ def run_all_methods(
     methods_to_run: List[str] | None = None,
     summary_path_for_checkpoints: str | None = None,
     coverage_path_for_checkpoints: str | None = None,
+    model_save_dir: str | None = None,
+    split_meta: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     test_df = test_df.reset_index(drop=True)
     mcfg = cfg["methods"]
@@ -995,6 +1263,15 @@ def run_all_methods(
                 )
                 fit_s = time.perf_counter() - t0
                 print(f"[{method_label}][v{vidx}] Done Convex Hull (fit={fit_s:.3f}s)")
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": scope},
+                )
                 fitted.append((vidx, method_cfg, model, fit_s, int(len(train_m))))
 
             cached_predictions = []
@@ -1064,6 +1341,15 @@ def run_all_methods(
                 )
                 fit_s = time.perf_counter() - t0
                 print(f"[{method_label}][v{vidx}] Done Alpha-shape (fit={fit_s:.3f}s)")
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": "per_cell"},
+                )
                 fitted.append((vidx, method_cfg, model, fit_s, int(len(train_m))))
 
             cached_predictions = []
@@ -1132,6 +1418,15 @@ def run_all_methods(
                 suffix = "" if model.available else "_missing_dep"
                 method_group = f"2_kriging{suffix}"
                 print(f"[{method_label}][v{vidx}] Done Kriging{suffix} (fit={fit_s:.3f}s)")
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": scope},
+                )
                 fitted.append((vidx, method_cfg, method_group, model, fit_s, int(len(train_m))))
 
             test_groups = [
@@ -1201,6 +1496,15 @@ def run_all_methods(
                 fit_s = time.perf_counter() - t0
                 method_group = "3_idw"
                 print(f"[{method_label}][v{vidx}] Done IDW (fit={fit_s:.3f}s)")
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": scope},
+                )
                 fitted.append((vidx, method_cfg, method_group, model, fit_s, int(len(train_m))))
 
             for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
@@ -1386,6 +1690,15 @@ def run_all_methods(
                 fit_s = time.perf_counter() - t0
                 suffix = "" if model.available else "_missing_dep"
                 method_group = f"4_ml{suffix}"
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": scope, "feature_set": feature_set, "feature_cols": feature_cols},
+                )
 
                 t0 = time.perf_counter()
                 sig_pred = np.full(shape=len(test_df), fill_value=float("nan"), dtype=float)
@@ -1446,6 +1759,15 @@ def run_all_methods(
                 suffix = "" if model.available else "_missing_dep"
                 method_group = f"5_gpr{suffix}"
                 print(f"[{method_label}][v{vidx}] Done GPR{suffix} (fit={fit_s:.3f}s)")
+                _save_model_artifact(
+                    model_save_dir,
+                    split_meta,
+                    method_group,
+                    vidx,
+                    model,
+                    method_cfg,
+                    extra={"scope": scope},
+                )
                 fitted.append((vidx, method_cfg, method_group, model, fit_s, int(len(train_m))))
 
             for vidx, method_cfg, method_group, model, fit_s, n_train_used in fitted:
@@ -1516,6 +1838,34 @@ def main():
         default=None,
         help="Enable stratified K-fold split by cell_id with the given number of folds.",
     )
+    parser.add_argument(
+        "--save-models-dir",
+        default="",
+        help="Optional directory to persist trained models per split/method/variant.",
+    )
+    parser.add_argument(
+        "--evaluate-saved-models-dir",
+        default="",
+        help="If set, skip training and evaluate saved model artifacts from this directory on external traces.",
+    )
+    parser.add_argument(
+        "--evaluate-trace",
+        action="append",
+        default=[],
+        help="Trace CSV path or glob pattern for external evaluation (repeatable).",
+    )
+    parser.add_argument(
+        "--evaluate-threshold",
+        action="append",
+        type=float,
+        default=[],
+        help="Coverage threshold(s) dBm for external evaluation (repeatable).",
+    )
+    parser.add_argument(
+        "--evaluate-out-prefix",
+        default="results/metrics/eval_saved_models",
+        help="Output prefix for external evaluation CSV files.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -1528,6 +1878,19 @@ def main():
     if args.kfolds is not None:
         cfg.setdefault("split", {})["strategy"] = "stratified_kfold"
         cfg.setdefault("split", {})["n_splits"] = int(args.kfolds)
+
+    if args.evaluate_saved_models_dir.strip():
+        thresholds = args.evaluate_threshold or [
+            float(x) for x in cfg.get("preprocess", {}).get("signal_threshold_dbm", [-100.0, -110.0])
+        ]
+        evaluate_saved_models(
+            cfg=cfg,
+            models_dir=args.evaluate_saved_models_dir.strip(),
+            trace_patterns=args.evaluate_trace or ["data/connectivity/drone/*.csv"],
+            thresholds_dbm=thresholds,
+            out_prefix=args.evaluate_out_prefix,
+        )
+        return
 
     print("[INIT] Loading data...")
     df = load_all_data(cfg)
@@ -1599,6 +1962,8 @@ def main():
             # For repeated runs we aggregate at the end; avoid mixed per-row checkpoint appends.
             summary_path_for_checkpoints=(out_summary if total_runs == 1 else None),
             coverage_path_for_checkpoints=(out_coverage if total_runs == 1 else None),
+            model_save_dir=(args.save_models_dir.strip() or None),
+            split_meta={**split_meta, "repeat_id": int(ridx)},
         )
         if not summary_r.empty:
             summary_r = summary_r.copy()

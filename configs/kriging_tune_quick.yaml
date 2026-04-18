@@ -1,0 +1,37 @@
+data:
+  root_dir: data/connectivity
+  skip_ocid: true
+  measurement_features_csv: data/connectivity/derived/measurement_altitudes_dem.csv
+  bs_features_csv: data/connectivity/derived/bs_altitudes_dem_matched.csv
+
+preprocess:
+  min_signal_dbm: -150
+  max_signal_dbm: -30
+  min_total_samples_per_cell: 10
+  signal_threshold_dbm: [-105, -110, -115, -120]
+
+split:
+  strategy: random
+  test_fraction: 0.3
+  random_state: 42
+
+methods:
+  kriging:
+    min_samples: 6
+    variogram_model: [spherical, gaussian, exponential, linear]
+    nlags: [8, 12]
+    jitter_epsilon: 0.01
+    outlier:
+      strategy: mad
+      percentile: 98.0
+      mad_k: 3.5
+      dbscan_eps: 0.0007
+      dbscan_min_samples: 5
+      min_keep: 6
+
+experiment:
+  max_cells: null
+
+output:
+  summary_csv: results/metrics/metrics_summary_kriging_tune_quick.csv
+  split_info_csv: results/metrics/split_info_kriging_tune_quick.csv

@@ -1,0 +1,37 @@
+data:
+  root_dir: data/connectivity
+  skip_ocid: true
+  measurement_features_csv: data/connectivity/derived/measurement_altitudes_dem.csv
+  bs_features_csv: data/connectivity/derived/bs_altitudes_dem_matched.csv
+
+preprocess:
+  min_signal_dbm: -150
+  max_signal_dbm: -30
+  min_total_samples_per_cell: 10
+  signal_threshold_dbm: [-105, -110, -115, -120]
+
+split:
+  strategy: random
+  test_fraction: 0.3
+  random_state: 42
+
+methods:
+  gpr:
+    min_samples: 8
+    length_scale: [0.001, 0.002]
+    noise_level: [1.0, 2.0]
+    alpha: 1.0e-6
+    normalize_y: true
+    max_train: 400
+    random_state: 42
+    outlier:
+      strategy: mad
+      mad_k: 3.5
+      min_keep: 8
+
+experiment:
+  max_cells: null
+
+output:
+  summary_csv: results/metrics/metrics_summary_gpr_tune_4.csv
+  split_info_csv: results/metrics/split_info_gpr_tune_4.csv
