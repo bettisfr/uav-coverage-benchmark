@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 .env
 .codex-project-id
+
+results/models/
