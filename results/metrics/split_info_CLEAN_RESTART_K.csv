@@ -1,0 +1,6 @@
+repeat_id,n_total,n_train,n_test,split_strategy,split_point,fold_id,n_splits,n_cells_total,n_cells_train,n_cells_test
+0,159324,127114,32210,stratified_kfold,,0,5,875,875,875
+1,159324,127307,32017,stratified_kfold,,1,5,875,875,875
+2,159324,127471,31853,stratified_kfold,,2,5,875,875,875
+3,159324,127623,31701,stratified_kfold,,3,5,875,875,875
+4,159324,127781,31543,stratified_kfold,,4,5,875,875,875
