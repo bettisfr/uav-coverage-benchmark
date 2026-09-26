@@ -28,6 +28,34 @@ except Exception:  # pragma: no cover
 
 STD_COLS = ["lat", "lon", "cell_id", "signal", "measured_at", "mode", "source_file"]
 
+# Canonical RSSI quality bins (in dBm), shared across training/evaluation/paper.
+# Intervals:
+#   0: Very poor  -> (-inf, -95]
+#   1: Poor       -> (-95, -85]
+#   2: Fair       -> (-85, -75]
+#   3: Good       -> (-75, -65]
+#   4: Excellent  -> (-65, +inf)
+RSSI_QUALITY_CLASS_NAMES = ["very_poor", "poor", "fair", "good", "excellent"]
+RSSI_QUALITY_BIN_EDGES_DBM = [-np.inf, -95.0, -85.0, -75.0, -65.0, np.inf]
+
+
+def rssi_to_quality_class_index(signal_dbm: np.ndarray | pd.Series) -> np.ndarray:
+    """
+    Map RSSI values (dBm) to ordinal quality classes [0..4].
+    Class order:
+      0=very_poor, 1=poor, 2=fair, 3=good, 4=excellent
+    """
+    x = np.asarray(signal_dbm, dtype=float)
+    out = np.full(x.shape, -1, dtype=int)
+    valid = np.isfinite(x)
+    if not np.any(valid):
+        return out
+
+    # np.digitize with right=True enforces:
+    #   -95 -> class 0, (-95, -85] -> class 1, ..., > -65 -> class 4.
+    out[valid] = np.digitize(x[valid], RSSI_QUALITY_BIN_EDGES_DBM[1:-1], right=True)
+    return out
+
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -410,6 +438,96 @@ def _evaluate_coverage_from_signal(y_true: np.ndarray, y_pred: np.ndarray, thres
     }
 
 
+def _to_rssi_quality_labels(y_true_signal: np.ndarray, y_pred_signal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert true/predicted RSSI signals (dBm) to ordinal quality labels.
+    Returned labels are in [0..4] following RSSI_QUALITY_CLASS_NAMES.
+    Invalid pairs are filtered out consistently.
+    """
+    yt = np.asarray(y_true_signal, dtype=float)
+    yp = np.asarray(y_pred_signal, dtype=float)
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if not np.any(mask):
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    y_true_lbl = rssi_to_quality_class_index(yt[mask])
+    y_pred_lbl = rssi_to_quality_class_index(yp[mask])
+    return y_true_lbl.astype(int), y_pred_lbl.astype(int)
+
+
+def _evaluate_rssi_quality_multiclass(y_true_lbl: np.ndarray, y_pred_lbl: np.ndarray) -> Dict[str, float]:
+    """
+    Evaluate ordinal RSSI-quality classification on labels in [0..4].
+    Returns macro/weighted F1, balanced accuracy, quadratic weighted kappa,
+    and MAE on class index distance (ordinal error).
+    """
+    yt = np.asarray(y_true_lbl, dtype=int)
+    yp = np.asarray(y_pred_lbl, dtype=int)
+    mask = (yt >= 0) & (yt < len(RSSI_QUALITY_CLASS_NAMES)) & (yp >= 0) & (yp < len(RSSI_QUALITY_CLASS_NAMES))
+    yt = yt[mask]
+    yp = yp[mask]
+    n = int(len(yt))
+    n_classes = int(len(RSSI_QUALITY_CLASS_NAMES))
+    if n == 0:
+        return {
+            "quality_macro_f1": float("nan"),
+            "quality_weighted_f1": float("nan"),
+            "quality_bal_acc": float("nan"),
+            "quality_qwk": float("nan"),
+            "quality_mae_class": float("nan"),
+            "quality_n_valid": 0,
+        }
+
+    cm = np.zeros((n_classes, n_classes), dtype=float)
+    for t, p in zip(yt, yp):
+        cm[t, p] += 1.0
+
+    per_class_f1 = []
+    class_support = cm.sum(axis=1)
+    recalls = []
+    for c in range(n_classes):
+        tp = cm[c, c]
+        fp = cm[:, c].sum() - tp
+        fn = cm[c, :].sum() - tp
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2.0 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+        per_class_f1.append(float(f1))
+        recalls.append(float(rec))
+
+    macro_f1 = float(np.mean(per_class_f1))
+    weights = class_support / class_support.sum() if class_support.sum() > 0 else np.zeros_like(class_support)
+    weighted_f1 = float(np.sum(np.array(per_class_f1, dtype=float) * weights))
+    bal_acc = float(np.mean(recalls))
+
+    # Quadratic Weighted Kappa (QWK)
+    O = cm / cm.sum() if cm.sum() > 0 else cm
+    hist_t = cm.sum(axis=1)
+    hist_p = cm.sum(axis=0)
+    E = np.outer(hist_t, hist_p)
+    if E.sum() > 0:
+        E = E / E.sum()
+    W = np.zeros((n_classes, n_classes), dtype=float)
+    denom = float((n_classes - 1) ** 2) if n_classes > 1 else 1.0
+    for i in range(n_classes):
+        for j in range(n_classes):
+            W[i, j] = ((i - j) ** 2) / denom
+    num = float((W * O).sum())
+    den = float((W * E).sum())
+    qwk = float("nan") if den <= 1e-12 else float(1.0 - (num / den))
+
+    mae_class = float(np.mean(np.abs(yp - yt)))
+
+    return {
+        "quality_macro_f1": macro_f1,
+        "quality_weighted_f1": weighted_f1,
+        "quality_bal_acc": bal_acc,
+        "quality_qwk": qwk,
+        "quality_mae_class": mae_class,
+        "quality_n_valid": n,
+    }
+
+
 def _prepare_ml_frame_for_eval(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     if "dist_bs_m" in out.columns:
@@ -447,6 +565,7 @@ def evaluate_saved_models(
     trace_patterns: List[str],
     thresholds_dbm: List[float],
     out_prefix: str,
+    only_seen_cells: bool = False,
 ) -> None:
     trace_paths: List[str] = []
     for pat in trace_patterns:
@@ -476,8 +595,17 @@ def evaluate_saved_models(
     max_signal = float(cfg.get("preprocess", {}).get("max_signal_dbm", -30.0))
     test_df = test_df[(test_df["signal"] >= min_signal) & (test_df["signal"] <= max_signal)].copy()
     test_df = test_df[(test_df["lat"] >= -90) & (test_df["lat"] <= 90) & (test_df["lon"] >= -180) & (test_df["lon"] <= 180)].copy()
+    if only_seen_cells:
+        train_ref = load_all_data(cfg)
+        train_ref = enrich_with_derived_features(train_ref, cfg)
+        train_ref = apply_common_filters(train_ref, cfg)
+        seen_cells = set(train_ref["cell_id"].astype(int).unique().tolist())
+        before = len(test_df)
+        test_df = test_df[test_df["cell_id"].isin(seen_cells)].copy()
+        print(f"[EVAL] Seen-cell filter: kept {len(test_df)}/{before} rows (excluded {before-len(test_df)} unseen-cell rows)")
     if test_df.empty:
         raise ValueError("No rows left in evaluation trace after filters.")
+    test_df = test_df.reset_index(drop=True)
 
     test_ml = _prepare_ml_frame_for_eval(test_df)
     y_true = test_df["signal"].to_numpy(dtype=float)
@@ -757,6 +885,65 @@ def _method_coverage_summaries(
     return rows
 
 
+def _method_quality_summary(
+    base_row: Dict[str, object],
+    y_true_signal: np.ndarray,
+    y_pred_signal: np.ndarray,
+) -> Dict[str, object]:
+    keep_keys = [
+        "method",
+        "method_group",
+        "variant",
+        "n_train_global",
+        "n_train_used",
+        "n_test",
+        "fit_seconds",
+        "predict_seconds",
+        "total_seconds",
+    ]
+    keep_keys.extend([k for k in base_row.keys() if str(k).startswith("param_")])
+    out = {k: base_row.get(k) for k in keep_keys if k in base_row}
+    y_true_lbl, y_pred_lbl = _to_rssi_quality_labels(y_true_signal, y_pred_signal)
+    out.update(_evaluate_rssi_quality_multiclass(y_true_lbl, y_pred_lbl))
+    return out
+
+
+def _method_quality_confusion_rows(
+    base_row: Dict[str, object],
+    y_true_signal: np.ndarray,
+    y_pred_signal: np.ndarray,
+) -> List[Dict[str, object]]:
+    keep_keys = ["method", "method_group", "variant"]
+    keep_keys.extend([k for k in base_row.keys() if str(k).startswith("param_")])
+    prefix = {k: base_row.get(k) for k in keep_keys if k in base_row}
+
+    y_true_lbl, y_pred_lbl = _to_rssi_quality_labels(y_true_signal, y_pred_signal)
+    n_classes = len(RSSI_QUALITY_CLASS_NAMES)
+    if len(y_true_lbl) == 0:
+        return []
+
+    cm = np.zeros((n_classes, n_classes), dtype=int)
+    for t, p in zip(y_true_lbl, y_pred_lbl):
+        if 0 <= t < n_classes and 0 <= p < n_classes:
+            cm[t, p] += 1
+
+    rows: List[Dict[str, object]] = []
+    for ti in range(n_classes):
+        for pi in range(n_classes):
+            row = dict(prefix)
+            row.update(
+                {
+                    "true_class_idx": int(ti),
+                    "true_class_name": RSSI_QUALITY_CLASS_NAMES[ti],
+                    "pred_class_idx": int(pi),
+                    "pred_class_name": RSSI_QUALITY_CLASS_NAMES[pi],
+                    "count": int(cm[ti, pi]),
+                }
+            )
+            rows.append(row)
+    return rows
+
+
 def _order_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -818,6 +1005,57 @@ def _format_summary_for_output(df: pd.DataFrame) -> pd.DataFrame:
 
 def _format_coverage_for_output(df: pd.DataFrame) -> pd.DataFrame:
     return _order_coverage_columns(df.copy())
+
+
+def _order_quality_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    first_cols = [
+        "method",
+        "method_group",
+        "variant",
+        "quality_macro_f1",
+        "quality_weighted_f1",
+        "quality_bal_acc",
+        "quality_qwk",
+        "quality_mae_class",
+        "quality_n_valid",
+        "n_train_global",
+        "n_train_used",
+        "n_test",
+        "fit_seconds",
+        "predict_seconds",
+        "total_seconds",
+    ]
+    ordered = [c for c in first_cols if c in df.columns]
+    rest = [c for c in df.columns if c not in ordered]
+    return df[ordered + rest]
+
+
+def _format_quality_for_output(df: pd.DataFrame) -> pd.DataFrame:
+    return _order_quality_columns(df.copy())
+
+
+def _order_quality_cm_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    first_cols = [
+        "method",
+        "method_group",
+        "variant",
+        "true_class_idx",
+        "true_class_name",
+        "pred_class_idx",
+        "pred_class_name",
+        "count",
+    ]
+    ordered = [c for c in first_cols if c in df.columns]
+    rest = [c for c in df.columns if c not in ordered]
+    return df[ordered + rest]
+
+
+def _format_quality_cm_for_output(df: pd.DataFrame) -> pd.DataFrame:
+    return _order_quality_cm_columns(df.copy())
 
 
 def _aggregate_repeated_summaries(summary_raw: pd.DataFrame) -> pd.DataFrame:
@@ -917,6 +1155,60 @@ def _aggregate_repeated_coverages(coverage_raw: pd.DataFrame) -> pd.DataFrame:
     std_cols = [c for c in out.columns if c.endswith("_std")]
     base_cols = [c for c in out.columns if c not in std_cols]
     return out[base_cols + std_cols]
+
+
+def _aggregate_repeated_quality(quality_raw: pd.DataFrame) -> pd.DataFrame:
+    if quality_raw.empty:
+        return quality_raw
+    if "repeat_id" not in quality_raw.columns:
+        return quality_raw
+    group_cols = [
+        c
+        for c in quality_raw.columns
+        if c in {"method", "method_group", "variant", "n_train_global", "n_train_used", "n_test"} or c.startswith("param_")
+    ]
+    group_cols = [c for c in group_cols if c in quality_raw.columns]
+    metric_cols = [
+        c
+        for c in [
+            "quality_macro_f1",
+            "quality_weighted_f1",
+            "quality_bal_acc",
+            "quality_qwk",
+            "quality_mae_class",
+            "quality_n_valid",
+            "fit_seconds",
+            "predict_seconds",
+            "total_seconds",
+        ]
+        if c in quality_raw.columns
+    ]
+    grouped = quality_raw.groupby(group_cols, dropna=False, as_index=False)
+    mean_df = grouped[metric_cols].mean(numeric_only=True)
+    out = mean_df.copy()
+    out["n_repeats"] = grouped.size()["size"]
+    std_df = grouped[metric_cols].std(numeric_only=True, ddof=0).fillna(0.0)
+    for c in metric_cols:
+        out[f"{c}_std"] = std_df[c]
+    out = _order_quality_columns(out)
+    std_cols = [c for c in out.columns if c.endswith("_std")]
+    base_cols = [c for c in out.columns if c not in std_cols]
+    return out[base_cols + std_cols]
+
+
+def _aggregate_repeated_quality_cm(cm_raw: pd.DataFrame) -> pd.DataFrame:
+    if cm_raw.empty:
+        return cm_raw
+    if "repeat_id" not in cm_raw.columns:
+        return cm_raw
+    group_cols = [
+        c
+        for c in cm_raw.columns
+        if c in {"method", "method_group", "variant", "true_class_idx", "true_class_name", "pred_class_idx", "pred_class_name"} or c.startswith("param_")
+    ]
+    group_cols = [c for c in group_cols if c in cm_raw.columns]
+    out = cm_raw.groupby(group_cols, dropna=False, as_index=False)["count"].mean(numeric_only=True)
+    return _order_quality_cm_columns(out)
 
 
 def print_compact_summary(summary: pd.DataFrame) -> None:
@@ -1019,6 +1311,22 @@ def derive_coverage_output_path(summary_path: str) -> str:
     return f"{base}_coverage{ext}"
 
 
+def derive_quality_output_path(summary_path: str) -> str:
+    base, ext = os.path.splitext(summary_path)
+    ext = ext or ".csv"
+    if "metrics_summary" in base:
+        return base.replace("metrics_summary", "quality_summary") + ext
+    return f"{base}_quality{ext}"
+
+
+def derive_quality_cm_output_path(summary_path: str) -> str:
+    base, ext = os.path.splitext(summary_path)
+    ext = ext or ".csv"
+    if "metrics_summary" in base:
+        return base.replace("metrics_summary", "quality_confusion") + ext
+    return f"{base}_quality_confusion{ext}"
+
+
 def save_per_method_csv(summary: pd.DataFrame, summary_path: str) -> List[str]:
     if summary.empty or "method_group" not in summary.columns:
         return []
@@ -1108,6 +1416,24 @@ def clear_output_files(summary_path: str, split_path: str, methods_to_run: List[
     for mk in selected:
         for suffix in method_name_map.get(mk, []):
             p = f"{cbase}_{suffix}{cext}"
+            if os.path.exists(p):
+                os.remove(p)
+
+    quality_path = derive_quality_output_path(summary_path)
+    qbase, qext = os.path.splitext(quality_path)
+    qext = qext or ".csv"
+    for mk in selected:
+        for suffix in method_name_map.get(mk, []):
+            p = f"{qbase}_{suffix}{qext}"
+            if os.path.exists(p):
+                os.remove(p)
+
+    quality_cm_path = derive_quality_cm_output_path(summary_path)
+    qcbase, qcext = os.path.splitext(quality_cm_path)
+    qcext = qcext or ".csv"
+    for mk in selected:
+        for suffix in method_name_map.get(mk, []):
+            p = f"{qcbase}_{suffix}{qcext}"
             if os.path.exists(p):
                 os.remove(p)
 
@@ -1207,9 +1533,11 @@ def run_all_methods(
     methods_to_run: List[str] | None = None,
     summary_path_for_checkpoints: str | None = None,
     coverage_path_for_checkpoints: str | None = None,
+    quality_path_for_checkpoints: str | None = None,
+    quality_cm_path_for_checkpoints: str | None = None,
     model_save_dir: str | None = None,
     split_meta: dict | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     test_df = test_df.reset_index(drop=True)
     mcfg = cfg["methods"]
     methods_set = set(methods_to_run or ["convex_hull", "alpha_shape", "kriging", "idw", "gpr", "ml"])
@@ -1223,6 +1551,8 @@ def run_all_methods(
 
     summaries = []
     coverage_rows = []
+    quality_rows = []
+    quality_cm_rows = []
     method_sequence = [
         ("convex_hull", "CONVEX_HULL"),
         ("alpha_shape", "ALPHA_SHAPE"),
@@ -1310,9 +1640,17 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Convex Hull-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "alpha_shape":
@@ -1381,9 +1719,17 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Alpha-Shape-LR regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "kriging":
@@ -1468,9 +1814,17 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred_clean)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred_clean)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done Kriging regression (pred={pred_signal_s:.3f}s)")
 
         elif method_key == "idw":
@@ -1533,9 +1887,17 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred_clean)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred_clean)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done IDW regression (pred={pred_s:.3f}s)")
 
         elif method_key == "ml":
@@ -1727,9 +2089,17 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred_clean)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred_clean)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done ML{suffix} regression (fit={fit_s:.3f}s, pred={pred_s:.3f}s)")
 
         elif method_key == "gpr":
@@ -1796,16 +2166,24 @@ def run_all_methods(
                     )
                 summaries.append(row)
                 coverage_rows.extend(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm))
+                qrow = _method_quality_summary(row, y_true_signal, sig_pred_clean)
+                quality_rows.append(qrow)
+                qcm_rows = _method_quality_confusion_rows(row, y_true_signal, sig_pred_clean)
+                quality_cm_rows.extend(qcm_rows)
                 append_per_method_csv_rows(pd.DataFrame([row]), summary_path_for_checkpoints or "")
                 if coverage_path_for_checkpoints:
                     append_per_method_csv_rows(pd.DataFrame(_method_coverage_summaries(row, y_true_signal, sig_pred_clean, thresholds_dbm)), coverage_path_for_checkpoints)
+                if quality_path_for_checkpoints:
+                    append_per_method_csv_rows(pd.DataFrame([qrow]), quality_path_for_checkpoints)
+                if quality_cm_path_for_checkpoints and qcm_rows:
+                    append_per_method_csv_rows(pd.DataFrame(qcm_rows), quality_cm_path_for_checkpoints)
                 print(f"[{method_label}][v{vidx}] Done GPR regression (pred={pred_s:.3f}s)")
 
         # Method-level checkpoint save
         if summary_path_for_checkpoints:
             print("[CHECKPOINT] Method completed (rows already appended).")
 
-    return pd.DataFrame(summaries), pd.DataFrame(coverage_rows)
+    return pd.DataFrame(summaries), pd.DataFrame(coverage_rows), pd.DataFrame(quality_rows), pd.DataFrame(quality_cm_rows)
 
 def main():
     parser = argparse.ArgumentParser(description="Coverage benchmark runner")
@@ -1866,6 +2244,11 @@ def main():
         default="results/metrics/eval_saved_models",
         help="Output prefix for external evaluation CSV files.",
     )
+    parser.add_argument(
+        "--evaluate-only-seen-cells",
+        action="store_true",
+        help="During saved-model evaluation, exclude trace rows whose cell_id is not present in benchmark training data.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -1889,6 +2272,7 @@ def main():
             trace_patterns=args.evaluate_trace or ["data/connectivity/drone/*.csv"],
             thresholds_dbm=thresholds,
             out_prefix=args.evaluate_out_prefix,
+            only_seen_cells=bool(args.evaluate_only_seen_cells),
         )
         return
 
@@ -1902,8 +2286,10 @@ def main():
     print(f"[INIT] Rows after filters: {len(df)} | cells: {df['cell_id'].nunique() if not df.empty else 0}")
     out_summary = _append_tag_to_path(cfg["output"]["summary_csv"], args.run_tag.strip() or None)
     out_coverage = derive_coverage_output_path(out_summary)
+    out_quality = derive_quality_output_path(out_summary)
+    out_quality_cm = derive_quality_cm_output_path(out_summary)
     out_split = _append_tag_to_path(cfg["output"]["split_info_csv"], args.run_tag.strip() or None)
-    for out_path in [out_summary, out_coverage, out_split]:
+    for out_path in [out_summary, out_coverage, out_quality, out_quality_cm, out_split]:
         out_dir = os.path.dirname(out_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -1922,6 +2308,8 @@ def main():
 
     all_summaries = []
     all_coverages = []
+    all_qualities = []
+    all_quality_cm = []
     split_rows = []
 
     split_jobs: List[tuple[int, pd.DataFrame, pd.DataFrame, dict]] = []
@@ -1954,7 +2342,7 @@ def main():
         if strategy == "random":
             cfg_rep.setdefault("split", {})["random_state"] = base_seed + ridx
 
-        summary_r, coverage_r = run_all_methods(
+        summary_r, coverage_r, quality_r, quality_cm_r = run_all_methods(
             train_df,
             test_df,
             cfg_rep,
@@ -1962,6 +2350,8 @@ def main():
             # For repeated runs we aggregate at the end; avoid mixed per-row checkpoint appends.
             summary_path_for_checkpoints=(out_summary if total_runs == 1 else None),
             coverage_path_for_checkpoints=(out_coverage if total_runs == 1 else None),
+            quality_path_for_checkpoints=(out_quality if total_runs == 1 else None),
+            quality_cm_path_for_checkpoints=(out_quality_cm if total_runs == 1 else None),
             model_save_dir=(args.save_models_dir.strip() or None),
             split_meta={**split_meta, "repeat_id": int(ridx)},
         )
@@ -1973,6 +2363,14 @@ def main():
             coverage_r = coverage_r.copy()
             coverage_r["repeat_id"] = int(ridx)
             all_coverages.append(coverage_r)
+        if not quality_r.empty:
+            quality_r = quality_r.copy()
+            quality_r["repeat_id"] = int(ridx)
+            all_qualities.append(quality_r)
+        if not quality_cm_r.empty:
+            quality_cm_r = quality_cm_r.copy()
+            quality_cm_r["repeat_id"] = int(ridx)
+            all_quality_cm.append(quality_cm_r)
 
         split_rows.append(
             {
@@ -1998,6 +2396,10 @@ def main():
     summary = _aggregate_repeated_summaries(summary_raw) if total_runs > 1 else summary_raw
     coverage_raw = pd.concat(all_coverages, ignore_index=True) if all_coverages else pd.DataFrame()
     coverage = _aggregate_repeated_coverages(coverage_raw) if (total_runs > 1 and not coverage_raw.empty) else coverage_raw
+    quality_raw = pd.concat(all_qualities, ignore_index=True) if all_qualities else pd.DataFrame()
+    quality = _aggregate_repeated_quality(quality_raw) if (total_runs > 1 and not quality_raw.empty) else quality_raw
+    quality_cm_raw = pd.concat(all_quality_cm, ignore_index=True) if all_quality_cm else pd.DataFrame()
+    quality_cm = _aggregate_repeated_quality_cm(quality_cm_raw) if (total_runs > 1 and not quality_cm_raw.empty) else quality_cm_raw
     print("[SAVE] Writing summary...")
     summary = _format_summary_for_output(summary)
     per_method_paths = save_per_method_csv(summary, out_summary)
@@ -2007,6 +2409,18 @@ def main():
         per_method_cov_paths = save_per_method_csv(coverage, out_coverage)
     else:
         per_method_cov_paths = []
+    if not quality.empty:
+        print("[SAVE] Writing RSSI quality summary...")
+        quality = _format_quality_for_output(quality)
+        per_method_quality_paths = save_per_method_csv(quality, out_quality)
+    else:
+        per_method_quality_paths = []
+    if not quality_cm.empty:
+        print("[SAVE] Writing RSSI quality confusion...")
+        quality_cm = _format_quality_cm_for_output(quality_cm)
+        per_method_quality_cm_paths = save_per_method_csv(quality_cm, out_quality_cm)
+    else:
+        per_method_quality_cm_paths = []
 
     split_info = pd.DataFrame(split_rows)
     print("[SAVE] Writing split info...")
@@ -2019,6 +2433,14 @@ def main():
     if per_method_cov_paths:
         print("Saved per-method coverage CSV files:")
         for p in per_method_cov_paths:
+            print(f" - {p}")
+    if per_method_quality_paths:
+        print("Saved per-method RSSI quality CSV files:")
+        for p in per_method_quality_paths:
+            print(f" - {p}")
+    if per_method_quality_cm_paths:
+        print("Saved per-method RSSI quality confusion CSV files:")
+        for p in per_method_quality_cm_paths:
             print(f" - {p}")
     print(f"Saved split info to {out_split}")
     print("[RESULT] Compact table (sorted by RMSE):")
